@@ -1,12 +1,12 @@
 @file:Suppress("ktlint:standard:max-line-length")
 
-import org.jetbrains.kotlin.config.KotlinCompilerVersion
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
 version = properties["coreVersion"].toString()
 
 plugins {
     `java-library`
+    `java-test-fixtures`
     kotlin("jvm")
     id("com.android.lint")
 
@@ -68,7 +68,7 @@ publishing {
 }
 
 tasks.withType<KotlinCompile>().configureEach {
-    kotlinOptions.postHogConfig()
+    compilerOptions.postHogConfig()
 }
 
 kotlin {
@@ -92,7 +92,7 @@ animalsniffer {
 }
 
 dependencies {
-    implementation(kotlin("stdlib-jdk8", KotlinCompilerVersion.VERSION))
+    implementation(kotlin("stdlib-jdk8", PosthogBuildConfig.Kotlin.KOTLIN))
 
     implementation("com.google.code.gson:gson:${PosthogBuildConfig.Dependencies.GSON}")
 

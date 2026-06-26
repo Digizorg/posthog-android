@@ -3,6 +3,11 @@ import io.gitlab.arturbosch.detekt.Detekt
 import io.gitlab.arturbosch.detekt.DetektCreateBaselineTask
 
 // Top-level build file where you can add configuration options common to all sub-projects/modules.
+
+dependencyLocking {
+    lockAllConfigurations()
+}
+
 plugins {
     // release
     id("io.github.gradle-nexus.publish-plugin")
@@ -19,6 +24,10 @@ plugins {
 
 subprojects {
     apply(plugin = "org.jetbrains.dokka")
+
+    dependencyLocking {
+        lockAllConfigurations()
+    }
 }
 
 spotless {
@@ -51,6 +60,8 @@ tasks.withType<DetektCreateBaselineTask>().configureEach {
 
 apiValidation {
     ignoredProjects.add("posthog-android-sample")
+    // Pre-1.0 (0.x) module — public surface may change between minor versions until 1.0.0.
+    ignoredProjects.add("posthog-android-surveys-compose")
 }
 
 nexusPublishing.postHogConfig()

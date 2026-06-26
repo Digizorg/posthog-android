@@ -9,10 +9,13 @@ internal class PostHogFlagsRequest(
     apiKey: String,
     distinctId: String,
     anonymousId: String? = null,
+    deviceId: String? = null,
     groups: Map<String, String>? = null,
     personProperties: Map<String, Any?>? = null,
     groupProperties: Map<String, Map<String, Any?>>? = null,
     evaluationContexts: List<String>? = null,
+    flagKeys: List<String>? = null,
+    disableGeoip: Boolean = false,
 ) : HashMap<String, Any>() {
     init {
         this["api_key"] = apiKey
@@ -20,6 +23,9 @@ internal class PostHogFlagsRequest(
         this["timezone"] = TimeZone.getDefault().id
         if (!anonymousId.isNullOrBlank()) {
             this["\$anon_distinct_id"] = anonymousId
+        }
+        if (!deviceId.isNullOrBlank()) {
+            this["\$device_id"] = deviceId
         }
         if (groups?.isNotEmpty() == true) {
             this["groups"] = groups
@@ -32,6 +38,12 @@ internal class PostHogFlagsRequest(
         }
         if (evaluationContexts?.isNotEmpty() == true) {
             this["evaluation_contexts"] = evaluationContexts
+        }
+        if (flagKeys?.isNotEmpty() == true) {
+            this["flag_keys_to_evaluate"] = flagKeys
+        }
+        if (disableGeoip) {
+            this["geoip_disable"] = true
         }
     }
 }

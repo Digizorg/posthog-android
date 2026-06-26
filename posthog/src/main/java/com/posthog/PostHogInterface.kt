@@ -1,5 +1,7 @@
 package com.posthog
 
+import com.posthog.logs.PostHogLogSeverity
+import com.posthog.logs.PostHogLogger
 import com.posthog.surveys.Survey
 import java.util.Date
 import java.util.UUID
@@ -9,7 +11,65 @@ import java.util.UUID
  */
 public interface PostHogInterface : PostHogCoreInterface {
     /**
+     * Captures application log records into PostHog's logs product
+     * (separate from product analytics events). Use the severity-specific
+     * helpers ([PostHogLogger.trace], [debug][PostHogLogger.debug],
+     * [info][PostHogLogger.info], [warn][PostHogLogger.warn],
+     * [error][PostHogLogger.error], [fatal][PostHogLogger.fatal]) or the
+     * generic [PostHogLogger.log].
+     *
+     * ```kotlin
+     * posthog.logger.info("checkout opened")
+     * posthog.logger.error("payment failed", mapOf("code" to "PAY_3001"))
+     * ```
+     *
+     * Not to be confused with the internal `config.logger` debug sink.
+     */
+    public val logger: PostHogLogger
+
+    /**
+     * Captures a single log record into PostHog's logs product, with optional
+     * W3C distributed-tracing correlation.
+     *
+     * Prefer the [logger] facade ([logger].info, .error, …) for everyday
+     * logging. Reach for this entry point when you need to correlate a log
+     * with a distributed trace by attaching [traceId] / [spanId] / [traceFlags].
+     *
+     * ```kotlin
+     * posthog.captureLog(
+     *     "payment failed",
+     *     severity = PostHogLogSeverity.ERROR,
+     *     attributes = mapOf("code" to "PAY_3001"),
+     *     traceId = "4bf92f3577b34da6a3ce929d0e0e4736",
+     *     spanId = "00f067aa0ba902b7",
+     *     traceFlags = 0x01,
+     * )
+     * ```
+     *
+     * @param message the log message body; blank messages are dropped
+     * @param severity the log severity, defaults to [PostHogLogSeverity.INFO]
+     * @param attributes optional structured attributes; values must be
+     *   JSON-serializable (`String`, `Number`, `Boolean`, `Date`, lists or
+     *   maps of the same)
+     * @param traceId optional 32-character lowercase hex W3C trace id. The
+     *   ingestion service zeroes ids that are not exactly 16 bytes.
+     * @param spanId optional 16-character lowercase hex W3C span id. The
+     *   ingestion service zeroes ids that are not exactly 8 bytes.
+     * @param traceFlags optional W3C trace flags bitfield (bit 0 is the
+     *   `sampled` flag); emitted on the wire as `flags`.
+     */
+    public fun captureLog(
+        message: String,
+        severity: PostHogLogSeverity = PostHogLogSeverity.INFO,
+        attributes: Map<String, Any>? = null,
+        traceId: String? = null,
+        spanId: String? = null,
+        traceFlags: Int? = null,
+    )
+
+    /**
      * Captures events
+     * @param event the event name
      * @param distinctId the distinctId, the generated [distinctId] is used if not given
      * @param properties the custom properties
      * @param userProperties the user properties, set as a "$set" property, Docs https://posthog.com/docs/product-analytics/user-properties
@@ -38,6 +98,32 @@ public interface PostHogInterface : PostHogCoreInterface {
     )
 
     /**
+     * Records a breadcrumb-style exception step. A snapshot of the recorded steps is
+     * attached to every captured `$exception` event as `$exception_steps`, giving the
+     * error-tracking UI a timeline of recent activity leading up to each error.
+     *
+     * The buffer is a rolling window scoped to the SDK instance: it persists across
+     * captures and user identity changes, rotating only by byte-budget eviction
+     * (see [com.posthog.errortracking.PostHogExceptionStepsConfig]).
+     *
+     * Recording never throws into the host app: an empty message is ignored with a
+     * warning, and internal failures skip the step (logged via the configured logger).
+     *
+     * Recording is synchronous: the `$timestamp` is captured at call time and the step
+     * is normalized, byte-budget enforced, and buffered before this method returns, so a
+     * step recorded immediately before an exception or crash is present when it is
+     * captured. The work is bounded and cheap, adding negligible latency to the caller.
+     *
+     * @param message a non-empty description of the step
+     * @param properties optional user-supplied properties (the reserved keys
+     * `$message` and `$timestamp` are stripped)
+     */
+    public fun addExceptionStep(
+        message: String,
+        properties: Map<String, Any>? = null,
+    )
+
+    /**
      * Reloads the feature flags
      * @param onFeatureFlags the callback to get notified once feature flags is ready to use
      */
@@ -48,7 +134,8 @@ public interface PostHogInterface : PostHogCoreInterface {
      * Docs https://posthog.com/docs/feature-flags and https://posthog.com/docs/experiments
      * @param key the Key
      * @param defaultValue the default value if not found, false if not given
-     * @param sendFeatureFlagEvent (optional) If false, we won't send an $feature_flag_call event to PostHog.
+     * @param sendFeatureFlagEvent (optional) If false, we won't send an $feature_flag_called event to PostHog.
+     * @return Whether the feature flag is enabled.
      */
     public fun isFeatureEnabled(
         key: String,
@@ -61,7 +148,8 @@ public interface PostHogInterface : PostHogCoreInterface {
      * Docs https://posthog.com/docs/feature-flags and https://posthog.com/docs/experiments
      * @param key the Key
      * @param defaultValue the default value if not found
-     * @param sendFeatureFlagEvent (optional) If false, we won't send an $feature_flag_call event to PostHog.
+     * @param sendFeatureFlagEvent (optional) If false, we won't send an $feature_flag_called event to PostHog.
+     * @return The feature flag value, or [defaultValue] if not found.
      */
     public fun getFeatureFlag(
         key: String,
@@ -70,11 +158,23 @@ public interface PostHogInterface : PostHogCoreInterface {
     ): Any?
 
     /**
+     * Returns list of all feature flag result containing both value and payload.
+     * Docs https://posthog.com/docs/feature-flags and https://posthog.com/docs/experiments
+     * @return The currently loaded feature flag results, or null when flags are unavailable.
+     */
+    public fun getAllFeatureFlags(): List<FeatureFlagResult>?
+
+    /**
      * Returns the feature flag payload
      * Docs https://posthog.com/docs/feature-flags and https://posthog.com/docs/experiments
      * @param key the Key
      * @param defaultValue the default value if not found
+     * @return The feature flag payload, or [defaultValue] if not found.
      */
+    @Deprecated(
+        message = "Use getFeatureFlagResult() instead; note it sends the \$feature_flag_called event by default.",
+        replaceWith = ReplaceWith("getFeatureFlagResult(key)?.payload"),
+    )
     public fun getFeatureFlagPayload(
         key: String,
         defaultValue: Any? = null,
@@ -152,8 +252,29 @@ public interface PostHogInterface : PostHogCoreInterface {
 
     /**
      * Returns the registered [distinctId] property
+     * @return The current distinct ID.
      */
     public fun distinctId(): String
+
+    /**
+     * Returns the anonymous ID generated for this device before any [identify] call.
+     *
+     * Unlike [distinctId], this value does not change after [identify] — it always reflects
+     * the pre-identification anonymous identifier. Useful for linking anonymous sessions to
+     * identified users in downstream systems.
+     *
+     * @return The anonymous ID, or an empty string if the SDK is not enabled.
+     */
+    public fun getAnonymousId(): String
+
+    /**
+     * Returns the stable device identifier used for device-level feature flag bucketing.
+     * This ID persists across [identify] and [reset] calls, only changing on a fresh
+     * app install, manual cache clearing, or OS-initiated storage cleanup.
+     *
+     * @return The device ID, or an empty string if not yet initialized
+     */
+    public fun getDeviceId(): String
 
     /**
      * Starts a session
@@ -172,18 +293,24 @@ public interface PostHogInterface : PostHogCoreInterface {
 
     /**
      * Returns if a session is active
+     * @return Whether a session is currently active.
      */
     public fun isSessionActive(): Boolean
 
     /**
      * Returns if Session Replay is Active
      * Android only.
+     * @return Whether session replay is currently active.
      */
     public fun isSessionReplayActive(): Boolean
 
     /**
      * Starts session replay.
-     * This method will be NoOp if session replay is disabled in your project settings
+     * This method will be NoOp if session replay is disabled in your project settings.
+     *
+     * Note: This method respects ingestion controls configured in your project settings.
+     * If sampling is configured and the session is not sampled, recording will not start.
+     * If event triggers are configured, recording will not start until a matching event is captured.
      *
      * Android only.
      *
@@ -200,6 +327,7 @@ public interface PostHogInterface : PostHogCoreInterface {
 
     /**
      * Returns the session Id if a session is active
+     * @return The current session ID, or null if no session is active.
      */
     public fun getSessionId(): UUID?
 
@@ -225,7 +353,7 @@ public interface PostHogInterface : PostHogCoreInterface {
     /**
      * Sets person properties that will be included in feature flag evaluation requests.
      *
-     * @param properties Dictionary of person properties to include in flag evaluation
+     * @param userProperties Dictionary of person properties to include in flag evaluation
      * @param reloadFeatureFlags Whether to automatically reload feature flags after setting properties
      */
     public fun setPersonPropertiesForFlags(
@@ -243,7 +371,7 @@ public interface PostHogInterface : PostHogCoreInterface {
      * Sets properties for a specific group type to include when evaluating feature flags.
      *
      * @param type The group type identifier (e.g., "organization", "team")
-     * @param properties Dictionary of properties to set for this group type
+     * @param groupProperties Dictionary of properties to set for this group type
      * @param reloadFeatureFlags Whether to automatically reload feature flags after setting properties
      */
     public fun setGroupPropertiesForFlags(

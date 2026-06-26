@@ -12,24 +12,29 @@ import com.posthog.internal.parseISO8601Date
 import com.posthog.internal.surveys.PostHogSurveyHelper
 import com.posthog.internal.surveys.PostHogSurveysHandler
 import com.posthog.internal.surveys.canActivateRepeatedly
+import com.posthog.internal.surveys.detectSurveyLanguage
 import com.posthog.internal.surveys.hasEvents
 import com.posthog.internal.surveys.hasWaitPeriodPassed
+import com.posthog.internal.surveys.resolveSurveyTranslations
 import com.posthog.surveys.OnPostHogSurveyClosed
 import com.posthog.surveys.OnPostHogSurveyResponse
 import com.posthog.surveys.OnPostHogSurveyShown
 import com.posthog.surveys.PostHogDisplaySurvey
 import com.posthog.surveys.PostHogNextSurveyQuestion
 import com.posthog.surveys.PostHogSurveyResponse
+import com.posthog.surveys.PostHogSurveysDefaultDelegate
 import com.posthog.surveys.PostHogSurveysDelegate
 import com.posthog.surveys.RatingSurveyQuestion
 import com.posthog.surveys.SingleSurveyQuestion
 import com.posthog.surveys.Survey
 import com.posthog.surveys.SurveyMatchType
-import com.posthog.surveys.SurveyType
 import com.posthog.surveys.SurveyPropertyFilter
 import com.posthog.surveys.SurveyQuestion
 import com.posthog.surveys.SurveyQuestionBranching
+import com.posthog.surveys.SurveyQuestionTranslation
+import com.posthog.surveys.SurveyType
 import java.util.Date
+import java.util.Locale
 
 public class PostHogSurveysIntegration(
     context: Context,
@@ -54,6 +59,9 @@ public class PostHogSurveysIntegration(
         )
 
     private val deviceType: String = getDeviceType(context) ?: "Mobile"
+
+    // Held for reflectively constructing the optional Compose UI delegate (auto-discovery).
+    private val appContext: Context = context.applicationContext ?: context
 
     // Thread safety locks
     private val surveysLock = Any()
@@ -87,6 +95,16 @@ public class PostHogSurveysIntegration(
             isStarted = true
         }
 
+        // Resolve the delegate now, at app start — do NOT defer this to first
+        // render. The auto-discovered Compose delegate registers an
+        // ActivityLifecycleCallbacks to track the foreground activity; resolving
+        // it here guarantees that callback is registered before the first
+        // activity resumes, so it actually receives the resume. Resolving lazily
+        // (on the first survey) registers it too late — the resume has already
+        // fired and is not replayed, leaving no foreground activity to host the
+        // survey, which then closes immediately as a "non-active survey".
+        getSurveysDelegate()
+
         showNextSurvey()
     }
 
@@ -95,6 +113,10 @@ public class PostHogSurveysIntegration(
         synchronized(lifecycleLock) {
             isStarted = false
         }
+
+        // Tear down any survey UI still on screen so its dialog window doesn't outlive the
+        // integration; clearActiveSurvey() only resets our bookkeeping, not the delegate's UI.
+        cleanupSurveys()
 
         clearActiveSurvey()
 
@@ -128,13 +150,45 @@ public class PostHogSurveysIntegration(
     }
 
     /**
-     * Gets the surveys delegate from the PostHog config.
+     * Resolves the surveys delegate.
      *
-     * @return The surveys delegate from PostHogConfig.surveysConfig
+     * If the consumer explicitly set a delegate on
+     * [com.posthog.surveys.PostHogSurveysConfig], that one is always used.
+     * Otherwise — when the delegate is still the log-only
+     * [PostHogSurveysDefaultDelegate] — we try to auto-discover the optional
+     * `posthog-android-surveys-compose` UI delegate from the classpath, so
+     * adding that single dependency is enough to get a real survey UI with no
+     * extra wiring. When the module isn't present we fall back to the default.
+     *
+     * @return The surveys delegate to render with.
      */
     private fun getSurveysDelegate(): PostHogSurveysDelegate {
-        return config.surveysConfig.surveysDelegate
+        val configured = config.surveysConfig.surveysDelegate
+        if (configured !is PostHogSurveysDefaultDelegate) {
+            return configured
+        }
+        return autoDiscoveredComposeDelegate ?: configured
     }
+
+    /**
+     * The optional Compose UI delegate, reflectively loaded from
+     * `:posthog-android-surveys-compose` when it is on the classpath. Resolved
+     * once; `null` when the module isn't present. Mirrors the classpath probe
+     * the replay integration uses to detect Compose.
+     */
+    private val autoDiscoveredComposeDelegate: PostHogSurveysDelegate? by
+        lazy(LazyThreadSafetyMode.PUBLICATION) {
+            try {
+                val clazz = Class.forName(COMPOSE_DELEGATE_CLASS_NAME)
+                val constructor = clazz.getConstructor(Context::class.java)
+                (constructor.newInstance(appContext) as PostHogSurveysDelegate).also {
+                    config.logger.log("Surveys: auto-discovered Compose UI delegate.")
+                }
+            } catch (e: Throwable) {
+                config.logger.log("Surveys: Compose UI module not found, using default delegate: $e")
+                null
+            }
+        }
 
     private fun defaultMatchType(matchType: SurveyMatchType?): SurveyMatchType {
         return matchType ?: SurveyMatchType.I_CONTAINS
@@ -251,7 +305,17 @@ public class PostHogSurveysIntegration(
             return
         }
 
-        val displaySurvey = PostHogDisplaySurvey.toDisplaySurvey(survey)
+        val displayLanguage = resolveDisplayLanguage()
+        val translations = resolveSurveyTranslations(survey, displayLanguage)
+        val resolvedLanguage = translations.matchedKey
+        val resolvedQuestionTranslations = translations.questions
+
+        val displaySurvey =
+            PostHogDisplaySurvey.toDisplaySurvey(
+                survey,
+                surveyTranslation = translations.survey,
+                questionTranslations = resolvedQuestionTranslations,
+            )
 
         // Store the original survey for branching logic
         val originalSurvey = survey
@@ -260,72 +324,90 @@ public class PostHogSurveysIntegration(
         val onSurveyShown: OnPostHogSurveyShown = { shownSurvey ->
             // Check if shownSurvey is originalSurvey
             if (shownSurvey.id == originalSurvey.id) {
-                val currentActiveSurvey = activeSurvey
-
-                // If currentActiveSurvey is null, set this originalSurvey as active
-                if (currentActiveSurvey == null) {
-                    setActiveSurvey(originalSurvey)
+                // If no survey is active, set this originalSurvey as active
+                synchronized(activeSurveyLock) {
+                    if (activeSurvey == null) {
+                        activeSurvey = originalSurvey
+                        activeSurveyCompleted = false
+                        currentSurveyResponses.clear()
+                    }
                 }
 
                 // Send survey shown event
-                sendSurveyShownEvent(originalSurvey)
+                sendSurveyShownEvent(originalSurvey, resolvedLanguage)
 
                 // Clear up event-activated surveys if this survey has events
                 if (hasEvents(originalSurvey)) {
-                    eventActivatedSurveys.remove(originalSurvey.id)
+                    synchronized(eventActivationLock) {
+                        eventActivatedSurveys.remove(originalSurvey.id)
+                    }
                 }
             } else {
                 config.logger.log("Received a show event for a non-matching survey: ${shownSurvey.id} vs ${originalSurvey.id}")
             }
         }
 
-        val onSurveyResponse: OnPostHogSurveyResponse = { responseSurvey, questionIndex, response ->
-            // Get current active survey
-            val currentActiveSurvey = activeSurvey
+        val onSurveyResponse: OnPostHogSurveyResponse = onSurveyResponse@{ responseSurvey, questionIndex, response ->
+            // Calculate next question based on current response
+            val nextQuestion = getNextQuestion(originalSurvey, questionIndex, response)
+            var responsesToSend: Map<String, PostHogSurveyResponse>? = null
 
-            // Validate that this survey matches the currently active survey
-            if (currentActiveSurvey == null || responseSurvey.id != currentActiveSurvey.id) {
-                config.logger.log("Received a response event for a non-active survey")
-                null
-            } else {
-                // Calculate next question based on current response
-                val nextQuestion = getNextQuestion(originalSurvey, questionIndex, response)
+            synchronized(activeSurveyLock) {
+                // Validate that this survey matches the currently active survey
+                val currentActiveSurvey = activeSurvey
+                if (currentActiveSurvey == null || responseSurvey.id != currentActiveSurvey.id) {
+                    config.logger.log("Received a response event for a non-active survey")
+                    return@onSurveyResponse null
+                }
 
                 // Store the response for survey completion tracking
-                currentSurveyResponses[getResponseKey(questionIndex)] = response
+                currentSurveyResponses[getLegacyResponseKey(questionIndex)] = response
+                originalSurvey.questions.getOrNull(questionIndex)?.id?.takeIf { it.isNotEmpty() }?.let { questionId ->
+                    currentSurveyResponses[getQuestionIdResponseKey(questionId)] = response
+                }
 
                 // Check if survey is completed (needed on close event)
                 activeSurveyCompleted = nextQuestion.isSurveyCompleted
 
                 // Send completion event if survey is finished
                 if (activeSurveyCompleted) {
-                    sendSurveySentEvent(originalSurvey, currentSurveyResponses)
+                    responsesToSend = currentSurveyResponses.toMap()
                 }
-
-                nextQuestion
             }
+
+            responsesToSend?.let { sendSurveySentEvent(originalSurvey, it, resolvedLanguage, resolvedQuestionTranslations) }
+
+            nextQuestion
         }
 
         val onSurveyClosed: OnPostHogSurveyClosed = onSurveyClosed@{ _ ->
-            // Get current active survey and completion state
-            val currentActiveSurvey = activeSurvey
+            var surveyResponses: Map<String, PostHogSurveyResponse> = emptyMap()
+            var wasSurveyCompleted = false
 
-            // Validate that this survey matches the currently active survey
-            if (currentActiveSurvey == null || originalSurvey.id != currentActiveSurvey.id) {
-                config.logger.log("[Surveys] Received a close event for a non-active survey")
-                return@onSurveyClosed
+            synchronized(activeSurveyLock) {
+                // Validate that this survey matches the currently active survey
+                val currentActiveSurvey = activeSurvey
+                if (currentActiveSurvey == null || originalSurvey.id != currentActiveSurvey.id) {
+                    config.logger.log("[Surveys] Received a close event for a non-active survey")
+                    return@onSurveyClosed
+                }
+
+                // Get current active survey and completion state
+                surveyResponses = currentSurveyResponses.toMap()
+                wasSurveyCompleted = activeSurveyCompleted
+
+                activeSurvey = null
+                activeSurveyCompleted = false
+                currentSurveyResponses.clear()
             }
 
             // Send survey dismissed event if survey was not completed
-            if (!activeSurveyCompleted) {
-                sendSurveyDismissedEvent(originalSurvey)
+            if (!wasSurveyCompleted) {
+                sendSurveyDismissedEvent(originalSurvey, surveyResponses, resolvedLanguage, resolvedQuestionTranslations)
             }
 
             // Mark survey as seen
             setSurveySeen(originalSurvey)
-
-            // Clear active survey
-            clearActiveSurvey()
 
             // Show next survey in queue after a short delay
             Thread {
@@ -570,6 +652,13 @@ public class PostHogSurveysIntegration(
     // Lifecycle management
     private var isStarted: Boolean = false
 
+    private fun resolveDisplayLanguage(): String? {
+        val override = config.surveysConfig.overrideDisplayLanguage
+        val personProperties = config.remoteConfigHolder?.getPersonPropertiesForFlags()
+        val deviceLocale = Locale.getDefault().toLanguageTag()
+        return detectSurveyLanguage(override, personProperties, deviceLocale)
+    }
+
     /**
      * Checks if we can show the next survey.
      * Returns true if there's no active survey currently being displayed.
@@ -596,9 +685,9 @@ public class PostHogSurveysIntegration(
         // Use cached surveys pushed from remote config
         val activeSurveys = getActiveMatchingSurveys()
 
-        // Find the first survey that can be rendered. API surveys are shown
-        // programmatically by the host app via the public API, not by the auto-render flow.
-        val surveyToShow = activeSurveys.firstOrNull { it.type != SurveyType.API }
+        // Find the first survey that can be rendered (API-type surveys are excluded
+        // from auto-display — they should only be triggered programmatically)
+        val surveyToShow = activeSurveys.firstOrNull(::canAutoDisplaySurvey)
 
         if (surveyToShow != null) {
             // Use the existing showSurvey method which handles all the logic
@@ -607,15 +696,15 @@ public class PostHogSurveysIntegration(
     }
 
     /**
-     * Sets the currently active survey.
-     * This prevents multiple surveys from being shown simultaneously.
+     * Returns whether a survey can be auto-displayed to the user.
+     * Only popover and widget surveys are eligible for auto-display.
+     * API-type surveys must be triggered programmatically and are excluded.
+     *
+     * This mirrors the web SDK's `callSurveysAndEvaluateDisplayLogic` which filters
+     * `getActiveMatchingSurveys` results to only popover and widget types for auto-display.
      */
-    private fun setActiveSurvey(survey: Survey?) {
-        synchronized(activeSurveyLock) {
-            activeSurvey = survey
-            activeSurveyCompleted = false
-            currentSurveyResponses.clear()
-        }
+    private fun canAutoDisplaySurvey(survey: Survey): Boolean {
+        return survey.type == SurveyType.POPOVER || survey.type == SurveyType.WIDGET
     }
 
     /**
@@ -635,10 +724,14 @@ public class PostHogSurveysIntegration(
     /**
      * Sends a "survey shown" event to PostHog instance
      */
-    private fun sendSurveyShownEvent(survey: Survey) {
+    private fun sendSurveyShownEvent(
+        survey: Survey,
+        language: String?,
+    ) {
         sendSurveyEvent(
             event = "survey shown",
             survey = survey,
+            language = language,
         )
     }
 
@@ -651,19 +744,58 @@ public class PostHogSurveysIntegration(
     private fun sendSurveySentEvent(
         survey: Survey,
         responses: Map<String, PostHogSurveyResponse>,
+        language: String?,
+        questionTranslations: List<SurveyQuestionTranslation?>?,
     ) {
-        val questionProperties =
-            mutableMapOf<String, Any>(
-                "\$survey_questions" to survey.questions.map { it.question },
-            )
+        val additionalProperties =
+            buildSurveyResponseProperties(survey, responses, questionTranslations) +
+                mapOf(
+                    "\$set" to
+                        mapOf(
+                            getSurveyInteractionProperty(survey, "responded") to true,
+                        ),
+                )
 
-        // Add survey interaction property for "responded"
-        questionProperties["\$set"] =
-            mapOf(
-                getSurveyInteractionProperty(survey, "responded") to true,
-            )
+        sendSurveyEvent(
+            event = "survey sent",
+            survey = survey,
+            additionalProperties = additionalProperties,
+            language = language,
+        )
+    }
 
-        // Convert responses to simple values
+    /**
+     * Sends a "survey dismissed" event to PostHog instance
+     */
+    private fun sendSurveyDismissedEvent(
+        survey: Survey,
+        responses: Map<String, PostHogSurveyResponse>,
+        language: String?,
+        questionTranslations: List<SurveyQuestionTranslation?>?,
+    ) {
+        val additionalProperties =
+            buildSurveyResponseProperties(survey, responses, questionTranslations) +
+                mapOf(
+                    "\$survey_partially_completed" to surveyHasResponses(responses),
+                    "\$set" to
+                        mapOf(
+                            getSurveyInteractionProperty(survey, "dismissed") to true,
+                        ),
+                )
+
+        sendSurveyEvent(
+            event = "survey dismissed",
+            survey = survey,
+            additionalProperties = additionalProperties,
+            language = language,
+        )
+    }
+
+    private fun buildSurveyResponseProperties(
+        survey: Survey,
+        responses: Map<String, PostHogSurveyResponse>,
+        questionTranslations: List<SurveyQuestionTranslation?>?,
+    ): Map<String, Any> {
         val responsesProperties =
             responses.mapNotNull { (key, response) ->
                 response.toResponseValue()?.let { value ->
@@ -671,33 +803,27 @@ public class PostHogSurveysIntegration(
                 }
             }.toMap()
 
-        val additionalProperties = questionProperties + responsesProperties
+        val surveyQuestions =
+            survey.questions.mapIndexed { index, question ->
+                mutableMapOf<String, Any>().apply {
+                    question.id?.let { put("id", it) }
+                    // Use translated question text (if applied) so $survey_questions matches what the user saw.
+                    val translatedText = questionTranslations?.getOrNull(index)?.question
+                    val effectiveQuestion = translatedText ?: question.question
+                    effectiveQuestion?.let { put("question", it) }
 
-        sendSurveyEvent(
-            event = "survey sent",
-            survey = survey,
-            additionalProperties = additionalProperties,
-        )
+                    val responseKey =
+                        question.id?.takeIf { it.isNotEmpty() }?.let(::getQuestionIdResponseKey)
+                            ?: getLegacyResponseKey(index)
+                    responsesProperties[responseKey]?.let { put("response", it) }
+                }
+            }
+
+        return mapOf("\$survey_questions" to surveyQuestions) + responsesProperties
     }
 
-    /**
-     * Sends a "survey dismissed" event to PostHog instance
-     */
-    private fun sendSurveyDismissedEvent(survey: Survey) {
-        val additionalProperties =
-            mapOf(
-                "\$survey_questions" to survey.questions.map { it.question },
-                "\$set" to
-                    mapOf(
-                        getSurveyInteractionProperty(survey, "dismissed") to true,
-                    ),
-            )
-
-        sendSurveyEvent(
-            event = "survey dismissed",
-            survey = survey,
-            additionalProperties = additionalProperties,
-        )
+    private fun surveyHasResponses(responses: Map<String, PostHogSurveyResponse>): Boolean {
+        return responses.values.any { it.toResponseValue() != null }
     }
 
     /**
@@ -707,6 +833,7 @@ public class PostHogSurveysIntegration(
         event: String,
         survey: Survey,
         additionalProperties: Map<String, Any> = emptyMap(),
+        language: String? = null,
     ) {
         val postHog =
             postHog ?: run {
@@ -715,6 +842,9 @@ public class PostHogSurveysIntegration(
 
         val properties = getBaseSurveyEventProperties(survey).toMutableMap()
         properties.putAll(additionalProperties)
+        if (!language.isNullOrEmpty()) {
+            properties["\$survey_language"] = language
+        }
 
         postHog.capture(event, properties = properties)
     }
@@ -740,12 +870,20 @@ public class PostHogSurveysIntegration(
      * Generate the property key used to store a response for a given question index.
      * For index 0 returns "$survey_response", otherwise returns "$survey_response_<index>".
      */
-    private fun getResponseKey(index: Int): String {
+    private fun getLegacyResponseKey(index: Int): String {
         return if (index == 0) {
             "\$survey_response"
         } else {
             "\$survey_response_$index"
         }
+    }
+
+    /**
+     * Generate the property key used to store a response for a given question id.
+     * Returns "$survey_response_<questionId>".
+     */
+    private fun getQuestionIdResponseKey(questionId: String): String {
+        return "\$survey_response_$questionId"
     }
 
     // Seen Survey Tracking Methods
@@ -814,6 +952,11 @@ public class PostHogSurveysIntegration(
 
     private companion object {
         private const val NEXT_SURVEY_TRANSITION_DELAY_MS = 750L
+
+        // Fully-qualified name of the optional Compose UI delegate. Kept as a
+        // string so the core SDK has no compile-time dependency on the module.
+        private const val COMPOSE_DELEGATE_CLASS_NAME =
+            "com.posthog.android.surveys.compose.PostHogSurveysComposeDelegate"
     }
 
     /**

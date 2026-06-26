@@ -28,6 +28,35 @@ internal class PostHogConfigTest {
         assertNull(config.proxy)
         assertEquals(PostHogConfig.DEFAULT_FEATURE_FLAG_CACHE_SIZE, config.featureFlagCacheSize)
         assertEquals(PostHogConfig.DEFAULT_FEATURE_FLAG_CACHE_MAX_AGE_MS, config.featureFlagCacheMaxAgeMs)
+        assertNull(config.flagDefinitionCacheProvider)
+    }
+
+    @Test
+    fun `trims whitespace-sensitive config values`() {
+        val config =
+            PostHogConfig(
+                apiKey = " \n$TEST_API_KEY\t ",
+                host = " \nhttps://eu.i.posthog.com/\t ",
+                personalApiKey = " \nphx_test_personal_api_key\t ",
+            )
+
+        assertEquals(TEST_API_KEY, config.apiKey)
+        assertEquals("https://eu.i.posthog.com/", config.host)
+        assertEquals("phx_test_personal_api_key", config.personalApiKey)
+    }
+
+    @Test
+    fun `defaults blank personal api key to null after trimming whitespace`() {
+        val config = PostHogConfig(apiKey = TEST_API_KEY, personalApiKey = " \n\t ")
+
+        assertNull(config.personalApiKey)
+    }
+
+    @Test
+    fun `defaults a blank host after trimming whitespace`() {
+        val config = PostHogConfig(apiKey = TEST_API_KEY, host = " \n\t ")
+
+        assertEquals(PostHogConfig.DEFAULT_HOST, config.host)
     }
 
     @Test
@@ -417,6 +446,8 @@ internal class PostHogConfigTest {
         config.flushIntervalSeconds = 120
         config.featureFlagCacheSize = 500
         config.featureFlagCacheMaxAgeMs = 600000
+        val flagDefinitionCacheProvider = NoOpFlagDefinitionCacheProvider()
+        config.flagDefinitionCacheProvider = flagDefinitionCacheProvider
 
         assertEquals(true, config.debug)
         assertEquals(false, config.sendFeatureFlagEvent)
@@ -428,6 +459,7 @@ internal class PostHogConfigTest {
         assertEquals(120, config.flushIntervalSeconds)
         assertEquals(500, config.featureFlagCacheSize)
         assertEquals(600000, config.featureFlagCacheMaxAgeMs)
+        assertEquals(flagDefinitionCacheProvider, config.flagDefinitionCacheProvider)
     }
 
     @Test
@@ -501,6 +533,28 @@ internal class PostHogConfigTest {
     }
 
     @Test
+    fun `builder personalApiKey trims whitespace and enables localEvaluation when not explicitly set`() {
+        val config =
+            PostHogConfig.builder(TEST_API_KEY)
+                .personalApiKey(" \ntest-personal-api-key\t ")
+                .build()
+
+        assertEquals("test-personal-api-key", config.personalApiKey)
+        assertEquals(true, config.localEvaluation)
+    }
+
+    @Test
+    fun `builder blank personalApiKey does not enable localEvaluation when not explicitly set`() {
+        val config =
+            PostHogConfig.builder(TEST_API_KEY)
+                .personalApiKey(" \n\t ")
+                .build()
+
+        assertNull(config.personalApiKey)
+        assertEquals(false, config.localEvaluation)
+    }
+
+    @Test
     fun `builder personalApiKey does not override explicit localEvaluation false`() {
         val config =
             PostHogConfig.builder(TEST_API_KEY)
@@ -560,5 +614,40 @@ internal class PostHogConfigTest {
                 .evaluationContexts(null)
                 .build()
         assertNull(config.evaluationContexts)
+    }
+
+    @Test
+    fun `constructor sets flagDefinitionCacheProvider to null by default`() {
+        val config = PostHogConfig(apiKey = TEST_API_KEY)
+        assertNull(config.flagDefinitionCacheProvider)
+    }
+
+    @Test
+    fun `flagDefinitionCacheProvider property accepts provider`() {
+        val provider = NoOpFlagDefinitionCacheProvider()
+        val config = PostHogConfig(apiKey = TEST_API_KEY)
+        config.flagDefinitionCacheProvider = provider
+        assertEquals(provider, config.flagDefinitionCacheProvider)
+    }
+
+    @Test
+    fun `builder flagDefinitionCacheProvider method sets value and returns builder`() {
+        val provider = NoOpFlagDefinitionCacheProvider()
+        val builder = PostHogConfig.builder(TEST_API_KEY)
+        val result = builder.flagDefinitionCacheProvider(provider)
+        assertEquals(builder, result)
+
+        val config = builder.build()
+        assertEquals(provider, config.flagDefinitionCacheProvider)
+    }
+
+    private class NoOpFlagDefinitionCacheProvider : PostHogBlockingFlagDefinitionCacheProvider() {
+        override fun getFlagDefinitionsBlocking(): Map<String, Any?>? = null
+
+        override fun shouldFetchFlagDefinitionsBlocking(): Boolean = true
+
+        override fun onFlagDefinitionsReceivedBlocking(data: Map<String, Any?>) = Unit
+
+        override fun shutdownBlocking() = Unit
     }
 }

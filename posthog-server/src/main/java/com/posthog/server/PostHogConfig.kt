@@ -12,20 +12,22 @@ import com.posthog.server.internal.PostHogServerContext
 import java.net.Proxy
 
 /**
- * The SDK Config
+ * Server-side SDK configuration.
+ *
+ * Create instances directly in Kotlin, or use [builder] from Java.
  */
 public open class PostHogConfig constructor(
     /**
-     * The PostHog API Key
+     * The PostHog project API key.
      */
-    public val apiKey: String,
+    apiKey: String,
     /**
      * The PostHog Host
      * Defaults to https://us.i.posthog.com
      * EU Host: https://eu.i.posthog.com
      *
      */
-    public val host: String = DEFAULT_HOST,
+    host: String = DEFAULT_HOST,
     /**
      * Logs the debug logs to the [logger] if enabled
      * Defaults to false
@@ -88,8 +90,8 @@ public open class PostHogConfig constructor(
      */
     public var onFeatureFlags: PostHogOnFeatureFlags? = null,
     /**
-     * Hook that allows to sanitize the event properties
-     * The hook is called before the event is cached or sent over the wire
+     * Optional HTTP proxy for requests to the PostHog API.
+     * Defaults to null.
      */
     public var proxy: Proxy? = null,
     /**
@@ -124,7 +126,7 @@ public open class PostHogConfig constructor(
      * Required when localEvaluation is true.
      * Defaults to null
      */
-    public var personalApiKey: String? = null,
+    personalApiKey: String? = null,
     /**
      * Interval in seconds for polling feature flag definitions for local evaluation
      * Defaults to 30 seconds
@@ -138,17 +140,59 @@ public open class PostHogConfig constructor(
      */
     public var evaluationContexts: List<String>? = null,
 ) {
+    /**
+     * The PostHog project API key, trimmed of leading and trailing whitespace.
+     */
+    public val apiKey: String = apiKey.trim()
+
+    /**
+     * The PostHog Host
+     * Defaults to https://us.i.posthog.com
+     * EU Host: https://eu.i.posthog.com
+     */
+    public val host: String = host.trim().ifBlank { DEFAULT_HOST }
+
+    /**
+     * Personal API key for local evaluation
+     * Required when localEvaluation is true.
+     * Defaults to null
+     */
+    public var personalApiKey: String? = personalApiKey?.trim()?.ifBlank { null }
+
+    /**
+     * Shared cache provider for local-evaluation feature flag definitions.
+     *
+     * This can reduce duplicate definition fetches when multiple SDK instances run in
+     * the same service. Defaults to null.
+     */
+    public var flagDefinitionCacheProvider: PostHogFlagDefinitionCacheProvider? = null
+
     private val beforeSendCallbacks = mutableListOf<PostHogBeforeSend>()
     private val integrations = mutableListOf<PostHogIntegration>()
 
+    /**
+     * Adds a before-send hook that can mutate or drop events before they are queued.
+     *
+     * @param beforeSend Hook to add.
+     */
     public fun addBeforeSend(beforeSend: PostHogBeforeSend) {
         beforeSendCallbacks.add(beforeSend)
     }
 
+    /**
+     * Removes a previously added before-send hook.
+     *
+     * @param beforeSend Hook to remove.
+     */
     public fun removeBeforeSend(beforeSend: PostHogBeforeSend) {
         beforeSendCallbacks.remove(beforeSend)
     }
 
+    /**
+     * Adds an integration to install when the SDK is set up.
+     *
+     * @param integration Integration to add.
+     */
     public fun addIntegration(integration: PostHogIntegration) {
         integrations.add(integration)
     }
@@ -181,6 +225,7 @@ public open class PostHogConfig constructor(
                         personalApiKey = personalApiKey,
                         pollIntervalSeconds = pollIntervalSeconds,
                         onFeatureFlags = onFeatureFlags,
+                        flagDefinitionCacheProvider = flagDefinitionCacheProvider,
                     )
                 },
                 queueProvider = { config, api, endpoint, _, executor ->
@@ -222,10 +267,21 @@ public open class PostHogConfig constructor(
         public const val DEFAULT_FEATURE_FLAG_CALLED_CACHE_SIZE: Int = 1000
         public const val DEFAULT_POLL_INTERVAL_SECONDS: Int = 30
 
+        /**
+         * Creates a Java-friendly builder.
+         *
+         * @param apiKey PostHog project API key.
+         * @return A new [Builder].
+         */
         @JvmStatic
         public fun builder(apiKey: String): Builder = Builder(apiKey)
     }
 
+    /**
+     * Java-friendly builder for [PostHogConfig].
+     *
+     * @param apiKey PostHog project API key.
+     */
     public class Builder(private val apiKey: String) {
         private var host: String = DEFAULT_HOST
         private var debug: Boolean = false
@@ -248,15 +304,48 @@ public open class PostHogConfig constructor(
         private var personalApiKey: String? = null
         private var pollIntervalSeconds: Int = DEFAULT_POLL_INTERVAL_SECONDS
         private var evaluationContexts: List<String>? = null
+        private var flagDefinitionCacheProvider: PostHogFlagDefinitionCacheProvider? = null
 
+        /**
+         * Sets the PostHog ingestion host.
+         *
+         * @param host Host URL, usually [DEFAULT_US_HOST] or [DEFAULT_EU_HOST].
+         * @return This builder.
+         */
         public fun host(host: String): Builder = apply { this.host = host }
 
+        /**
+         * Enables or disables SDK debug logging.
+         *
+         * @param debug true to enable detailed SDK logs.
+         * @return This builder.
+         */
         public fun debug(debug: Boolean): Builder = apply { this.debug = debug }
 
+        /**
+         * Sets whether feature flag lookups send `$feature_flag_called` events by default.
+         *
+         * @param sendFeatureFlagEvent true to send usage events automatically.
+         * @return This builder.
+         */
         public fun sendFeatureFlagEvent(sendFeatureFlagEvent: Boolean): Builder = apply { this.sendFeatureFlagEvent = sendFeatureFlagEvent }
 
+        /**
+         * Sets whether feature flags are preloaded automatically during setup.
+         *
+         * @param preloadFeatureFlags true to preload feature flags.
+         * @return This builder.
+         */
         public fun preloadFeatureFlags(preloadFeatureFlags: Boolean): Builder = apply { this.preloadFeatureFlags = preloadFeatureFlags }
 
+        /**
+         * Sets the remote config preload flag.
+         *
+         * This option is deprecated because remote config is always enabled.
+         *
+         * @param remoteConfig Deprecated no-op value.
+         * @return This builder.
+         */
         @Deprecated(
             message = "Remote config is now always enabled. This option is a no-op and will be removed in a future version.",
             level = DeprecationLevel.WARNING,
@@ -264,65 +353,170 @@ public open class PostHogConfig constructor(
         @Suppress("DEPRECATION")
         public fun remoteConfig(remoteConfig: Boolean): Builder = apply { this.remoteConfig = remoteConfig }
 
+        /**
+         * Sets how many events are queued before an automatic flush.
+         *
+         * @param flushAt Event count threshold.
+         * @return This builder.
+         */
         public fun flushAt(flushAt: Int): Builder = apply { this.flushAt = flushAt }
 
+        /**
+         * Sets the maximum number of queued events kept in memory.
+         *
+         * @param maxQueueSize Maximum queued events.
+         * @return This builder.
+         */
         public fun maxQueueSize(maxQueueSize: Int): Builder = apply { this.maxQueueSize = maxQueueSize }
 
+        /**
+         * Sets the maximum number of events sent in one batch request.
+         *
+         * @param maxBatchSize Maximum batch size.
+         * @return This builder.
+         */
         public fun maxBatchSize(maxBatchSize: Int): Builder = apply { this.maxBatchSize = maxBatchSize }
 
+        /**
+         * Sets the periodic flush interval in seconds.
+         *
+         * @param flushIntervalSeconds Flush interval in seconds.
+         * @return This builder.
+         */
         public fun flushIntervalSeconds(flushIntervalSeconds: Int): Builder = apply { this.flushIntervalSeconds = flushIntervalSeconds }
 
+        /**
+         * Sets custom event encryption hooks.
+         *
+         * @param encryption Encryption implementation, or null for no encryption.
+         * @return This builder.
+         */
         public fun encryption(encryption: PostHogEncryption?): Builder = apply { this.encryption = encryption }
 
+        /**
+         * Sets the callback invoked when feature flags are loaded.
+         *
+         * @param onFeatureFlags Callback, or null for no callback.
+         * @return This builder.
+         */
         public fun onFeatureFlags(onFeatureFlags: PostHogOnFeatureFlags?): Builder = apply { this.onFeatureFlags = onFeatureFlags }
 
+        /**
+         * Sets an HTTP proxy for PostHog API requests.
+         *
+         * @param proxy Proxy to use, or null for no proxy.
+         * @return This builder.
+         */
         public fun proxy(proxy: Proxy?): Builder = apply { this.proxy = proxy }
 
+        /**
+         * Sets the maximum number of feature flag results cached in memory.
+         *
+         * @param featureFlagCacheSize Maximum cache entries.
+         * @return This builder.
+         */
         public fun featureFlagCacheSize(featureFlagCacheSize: Int): Builder = apply { this.featureFlagCacheSize = featureFlagCacheSize }
 
+        /**
+         * Sets the maximum age of a cached feature flag result in milliseconds.
+         *
+         * @param featureFlagCacheMaxAgeMs Maximum cache age in milliseconds.
+         * @return This builder.
+         */
         public fun featureFlagCacheMaxAgeMs(featureFlagCacheMaxAgeMs: Int): Builder =
             apply { this.featureFlagCacheMaxAgeMs = featureFlagCacheMaxAgeMs }
 
+        /**
+         * Sets the maximum number of distinct `$feature_flag_called` events tracked for deduplication.
+         *
+         * @param featureFlagCalledCacheSize Maximum deduplication cache entries.
+         * @return This builder.
+         */
         public fun featureFlagCalledCacheSize(featureFlagCalledCacheSize: Int): Builder =
             apply { this.featureFlagCalledCacheSize = featureFlagCalledCacheSize }
 
+        /**
+         * Enables or disables local feature flag evaluation.
+         *
+         * @param localEvaluation true to periodically fetch definitions and evaluate flags locally.
+         * @return This builder.
+         */
         public fun localEvaluation(localEvaluation: Boolean): Builder = apply { this.localEvaluation = localEvaluation }
 
+        /**
+         * Sets the personal API key used for local feature flag evaluation.
+         *
+         * Setting a non-blank personal API key automatically enables [localEvaluation] unless it has
+         * already been set explicitly.
+         *
+         * @param personalApiKey Personal API key, or null/blank to clear it.
+         * @return This builder.
+         */
         public fun personalApiKey(personalApiKey: String?): Builder =
             apply {
-                this.personalApiKey = personalApiKey
+                this.personalApiKey = personalApiKey?.trim()?.ifBlank { null }
                 if (localEvaluation == null) {
-                    this.localEvaluation = personalApiKey != null
+                    this.localEvaluation = this.personalApiKey != null
                 }
             }
 
+        /**
+         * Sets how often local evaluation flag definitions are polled.
+         *
+         * @param pollIntervalSeconds Poll interval in seconds.
+         * @return This builder.
+         */
         public fun pollIntervalSeconds(pollIntervalSeconds: Int): Builder = apply { this.pollIntervalSeconds = pollIntervalSeconds }
 
+        /**
+         * Sets evaluation context tags that constrain which feature flags are evaluated.
+         *
+         * @param evaluationContexts Context tags, or null to evaluate all flags.
+         * @return This builder.
+         */
         public fun evaluationContexts(evaluationContexts: List<String>?): Builder = apply { this.evaluationContexts = evaluationContexts }
 
+        /**
+         * Sets the provider for caching feature flag definitions.
+         *
+         * @param flagDefinitionCacheProvider The cache provider, or null to use the default.
+         * @return This builder.
+         */
+        public fun flagDefinitionCacheProvider(flagDefinitionCacheProvider: PostHogFlagDefinitionCacheProvider?): Builder =
+            apply { this.flagDefinitionCacheProvider = flagDefinitionCacheProvider }
+
+        /**
+         * Builds a [PostHogConfig] from the accumulated values.
+         *
+         * @return The configured server SDK config.
+         */
         @Suppress("DEPRECATION")
-        public fun build(): PostHogConfig =
-            PostHogConfig(
-                apiKey = apiKey,
-                host = host,
-                debug = debug,
-                sendFeatureFlagEvent = sendFeatureFlagEvent,
-                preloadFeatureFlags = preloadFeatureFlags,
-                remoteConfig = remoteConfig,
-                flushAt = flushAt,
-                maxQueueSize = maxQueueSize,
-                maxBatchSize = maxBatchSize,
-                flushIntervalSeconds = flushIntervalSeconds,
-                encryption = encryption,
-                onFeatureFlags = onFeatureFlags,
-                proxy = proxy,
-                featureFlagCacheSize = featureFlagCacheSize,
-                featureFlagCacheMaxAgeMs = featureFlagCacheMaxAgeMs,
-                featureFlagCalledCacheSize = featureFlagCalledCacheSize,
-                localEvaluation = localEvaluation ?: false,
-                personalApiKey = personalApiKey,
-                pollIntervalSeconds = pollIntervalSeconds,
-                evaluationContexts = evaluationContexts,
-            )
+        public fun build(): PostHogConfig {
+            val config =
+                PostHogConfig(
+                    apiKey = apiKey,
+                    host = host,
+                    debug = debug,
+                    sendFeatureFlagEvent = sendFeatureFlagEvent,
+                    preloadFeatureFlags = preloadFeatureFlags,
+                    remoteConfig = remoteConfig,
+                    flushAt = flushAt,
+                    maxQueueSize = maxQueueSize,
+                    maxBatchSize = maxBatchSize,
+                    flushIntervalSeconds = flushIntervalSeconds,
+                    encryption = encryption,
+                    onFeatureFlags = onFeatureFlags,
+                    proxy = proxy,
+                    featureFlagCacheSize = featureFlagCacheSize,
+                    featureFlagCacheMaxAgeMs = featureFlagCacheMaxAgeMs,
+                    featureFlagCalledCacheSize = featureFlagCalledCacheSize,
+                    localEvaluation = localEvaluation ?: false,
+                    personalApiKey = personalApiKey,
+                    pollIntervalSeconds = pollIntervalSeconds,
+                    evaluationContexts = evaluationContexts,
+                )
+            config.flagDefinitionCacheProvider = flagDefinitionCacheProvider
+            return config
+        }
     }
 }

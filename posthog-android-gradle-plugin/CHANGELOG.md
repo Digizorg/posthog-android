@@ -1,5 +1,23 @@
 ## Next
 
+## 1.2.0
+
+### Minor Changes
+
+- ebef906: Attach release info (`applicationId`, `versionName`, `versionCode`) to proguard mapping uploads via the new posthog-cli `--release-name`, `--release-version`, and `--build` flags.
+
+## 1.1.0
+
+### Minor Changes
+
+- 1144733: Configurable executable and env for CLI task
+
+## 1.0.4
+
+### Patch Changes
+
+- a5c3a78: fix duplicate map ids
+
 ## 1.0.3
 
 ### Patch Changes

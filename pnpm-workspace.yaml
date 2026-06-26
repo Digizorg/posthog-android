@@ -1,5 +1,8 @@
 packages:
     - "posthog"
     - "posthog-android"
+    - "posthog-android-surveys-compose"
     - "posthog-server"
     - "posthog-android-gradle-plugin"
+
+minimumReleaseAge: 10080

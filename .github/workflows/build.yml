@@ -4,43 +4,55 @@ on:
     branches:
       - main
   pull_request:
-    paths-ignore:
-      - "**/*.md"
 
 permissions:
   contents: read
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  detect-markdown-only:
+    uses: PostHog/.github/.github/workflows/detect-markdown-only.yml@ec25337d9fae0100622cbfea1bd5bd88284ac10b
+    permissions:
+      pull-requests: read
+
   build:
+    needs: detect-markdown-only
     name: Build Job
     runs-on: ubuntu-latest
 
     steps:
+      - name: Complete markdown-only PR check
+        if: needs.detect-markdown-only.outputs.markdown_only == 'true'
+        run: echo "Only Markdown files changed; no additional work is required for this check."
       - name: Git checkout
-        uses: actions/checkout@v6
+        if: needs.detect-markdown-only.outputs.markdown_only != 'true'
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: 'Set up Java 17'
-        uses: actions/setup-java@v5
+        if: needs.detect-markdown-only.outputs.markdown_only != 'true'
+        uses: actions/setup-java@ad2b38190b15e4d6bdf0c97fb4fca8412226d287 # v5.3.0
         with:
           java-version: '17'
           distribution: 'temurin'
 
       - name: Cache Gradle packages
-        uses: actions/cache@v5
+        if: needs.detect-markdown-only.outputs.markdown_only != 'true'
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
+            ~/.m2/repository/org/robolectric
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
 
       - name: Make compile
+        if: needs.detect-markdown-only.outputs.markdown_only != 'true'
         run: make compile
 
       - name: Make stop
+        if: needs.detect-markdown-only.outputs.markdown_only != 'true'
         run: make stop

@@ -15,6 +15,7 @@ import com.posthog.android.internal.PostHogAppInstallIntegration
 import com.posthog.android.internal.PostHogLifecycleObserverIntegration
 import com.posthog.android.internal.PostHogMetaPropertiesApplier
 import com.posthog.android.internal.PostHogSharedPreferences
+import com.posthog.android.internal.PostHogTouchActivityIntegration
 import com.posthog.android.internal.appContext
 import com.posthog.android.internal.getPackageInfo
 import com.posthog.android.internal.versionCodeCompat
@@ -28,19 +29,20 @@ import com.posthog.vendor.uuid.TimeBasedEpochGenerator
 import java.io.File
 
 /**
- * Main entrypoint for the Android SDK
- * Use the setup method to set a global and singleton instance
- * Or use the with method that returns an instance that you can hold and pass it around
+ * Main entry point for the Android SDK.
+ *
+ * Use [setup] to configure the process-wide singleton, or [with] to create an instance that you
+ * hold and pass around.
  */
 public class PostHogAndroid private constructor() {
     public companion object {
         private val lock = Any()
 
         /**
-         * Setup the SDK and set a global and singleton instance
-         * @param T the type of the Config
-         * @property context the Context
-         * @property config the Config
+         * Sets up the SDK and stores it as the global singleton.
+         *
+         * @param context Android context; the application context is retained internally.
+         * @param config Android SDK configuration.
          */
         public fun <T : PostHogAndroidConfig> setup(
             context: Context,
@@ -54,16 +56,15 @@ public class PostHogAndroid private constructor() {
         }
 
         /**
-         * Setup the SDK and returns an instance that you can hold and pass it around
+         * Creates and returns a configured SDK instance that you can hold and pass around.
          *
-         * All default PostHogIntegration's will only be installed for the very 1st instance,
-         * either that be created with the [setup] or [with] method otherwise they would race each other
-         * and cause issues, so the 1st instance of the SDK that is created on the hosting app
-         * will hold all installed integrations, the order of the setup matters.
+         * Default PostHog integrations are installed only on the first instance created by either
+         * [setup] or [with]. The first instance in the host app owns those integrations, so setup
+         * order matters.
          *
-         * @param T the type of the Config
-         * @property context the Context
-         * @property config the Config
+         * @param context Android context; the application context is retained internally.
+         * @param config Android SDK configuration.
+         * @return The configured PostHog client instance.
          */
         public fun <T : PostHogAndroidConfig> with(
             context: Context,
@@ -96,9 +97,11 @@ public class PostHogAndroid private constructor() {
             val legacyPath = context.getDir("app_posthog-disk-queue", Context.MODE_PRIVATE)
             val path = File(context.cacheDir, "posthog-disk-queue")
             val replayPath = File(context.cacheDir, "posthog-disk-replay-queue")
+            val logsPath = File(context.cacheDir, "posthog-disk-logs-queue")
             config.legacyStoragePrefix = config.legacyStoragePrefix ?: legacyPath.absolutePath
             config.storagePrefix = config.storagePrefix ?: path.absolutePath
             config.replayStoragePrefix = config.replayStoragePrefix ?: replayPath.absolutePath
+            config.logsStoragePrefix = config.logsStoragePrefix ?: logsPath.absolutePath
             val preferences = config.cachePreferences ?: PostHogSharedPreferences(context, config)
             config.cachePreferences = preferences
             // Defaults to PostHogDeviceDateProvider when api < 33
@@ -107,19 +110,27 @@ public class PostHogAndroid private constructor() {
                     val dateProvider = PostHogAndroidDateProvider()
                     config.dateProvider = dateProvider
                     TimeBasedEpochGenerator.setDateProvider(dateProvider)
+                    PostHogSessionManager.setDateProvider(dateProvider)
                 } else {
                     TimeBasedEpochGenerator.setDateProvider(config.dateProvider)
+                    PostHogSessionManager.setDateProvider(config.dateProvider)
                 }
             }
             config.networkStatus = config.networkStatus ?: PostHogAndroidNetworkStatus(context)
-            // Flutter and RN SDKs set the sdkName and sdkVersion, so this guard is not to allow
+            // Flutter, RN, and KMP SDKs set the sdkName and sdkVersion, so this guard is not to allow
             // the values to be overwritten again
-            if (config.sdkName != "posthog-flutter" && config.sdkName != "posthog-react-native") {
+            if (config.sdkName != "posthog-flutter" &&
+                config.sdkName != "posthog-react-native" &&
+                config.sdkName != "posthog-kmp"
+            ) {
                 config.sdkName = "posthog-android"
                 config.sdkVersion = BuildConfig.VERSION_NAME
             }
 
             PostHogSessionManager.isReactNative = config.sdkName == "posthog-react-native"
+            // Mark the process as backgrounded until the first onStart fires; an expired
+            // session before any UI exists is cleared rather than silently rotated.
+            PostHogSessionManager.setAppInBackground(true)
 
             val releaseIdentifierFallback = "$packageName@$versionName+$buildNumber"
             val metaPropertiesApplier = PostHogMetaPropertiesApplier()
@@ -130,6 +141,7 @@ public class PostHogAndroid private constructor() {
 
             val mainHandler = MainHandler()
             config.addIntegration(PostHogReplayIntegration(context, config, mainHandler))
+            config.addIntegration(PostHogTouchActivityIntegration(config))
             config.addIntegration(PostHogLogCatIntegration(config))
             if (context is Application) {
                 if (config.captureDeepLinks || config.captureScreenViews || config.sessionReplay) {

@@ -4,13 +4,14 @@ permissions:
     contents: read
 
 on:
-    pull_request:
-        types: [closed]
-        branches: [main]
-    workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.changeset/*.md'
+  workflow_dispatch:
 
 # Concurrency control: only one release process can run at a time
-# This prevents race conditions if multiple PRs with 'release' label merge simultaneously
+# This prevents race conditions if multiple releasable changesets merge simultaneously
 concurrency:
     group: release
     cancel-in-progress: false
@@ -19,17 +20,11 @@ jobs:
     check-changesets:
         name: Check for changesets
         runs-on: ubuntu-latest
-        # Run when PR with 'release' label is merged to main, or when manually triggered
-        if: |
-            github.event_name == 'workflow_dispatch' ||
-            (github.event_name == 'pull_request'
-             && github.event.pull_request.merged == true
-             && contains(github.event.pull_request.labels.*.name, 'release'))
         outputs:
             has-changesets: ${{ steps.check.outputs.has-changesets }}
         steps:
             - name: Checkout repository
-              uses: actions/checkout@v6
+              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
               with:
                   ref: main
                   fetch-depth: 0
@@ -50,7 +45,7 @@ jobs:
         name: Notify Slack - Approval Needed
         needs: check-changesets
         if: needs.check-changesets.outputs.has-changesets == 'true'
-        uses: PostHog/.github/.github/workflows/notify-approval-needed.yml@main
+        uses: PostHog/.github/.github/workflows/notify-approval-needed.yml@5fc4680761e8ac29a61b212756230eba0e276d8c
         with:
             slack_channel_id: ${{ vars.SLACK_APPROVALS_CLIENT_LIBRARIES_CHANNEL_ID }}
             slack_user_group_id: ${{ vars.GROUP_CLIENT_LIBRARIES_SLACK_GROUP_ID }}
@@ -67,11 +62,11 @@ jobs:
         permissions:
             contents: write
         outputs:
-            committed: ${{ steps.commit-version-bump.outputs.committed }}
+            committed: ${{ steps.commit-version-bump.outputs.commit-hash != '' }}
         steps:
             - name: Notify Slack - Approved
               continue-on-error: true
-              uses: PostHog/.github/.github/actions/slack-thread-reply@main
+              uses: PostHog/.github/.github/actions/slack-thread-reply@5fc4680761e8ac29a61b212756230eba0e276d8c
               with:
                   slack_bot_token: ${{ secrets.SLACK_CLIENT_LIBRARIES_BOT_TOKEN }}
                   slack_channel_id: ${{ vars.SLACK_APPROVALS_CLIENT_LIBRARIES_CHANNEL_ID }}
@@ -81,13 +76,13 @@ jobs:
 
             - name: Get GitHub App token
               id: releaser
-              uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+              uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
               with:
-                  app-id: ${{ secrets.GH_APP_POSTHOG_ANDROID_RELEASER_APP_ID }}
+                  client-id: ${{ secrets.GH_APP_POSTHOG_ANDROID_RELEASER_APP_ID }}
                   private-key: ${{ secrets.GH_APP_POSTHOG_ANDROID_RELEASER_PRIVATE_KEY }}
 
             - name: Checkout repository
-              uses: actions/checkout@v6
+              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
               with:
                   ref: main
                   fetch-depth: 0
@@ -109,33 +104,40 @@ jobs:
                   # Sync package.json versions back to gradle.properties
                   CORE_VERSION=$(node -p "require('./posthog/package.json').version")
                   ANDROID_VERSION=$(node -p "require('./posthog-android/package.json').version")
+                  SURVEYS_COMPOSE_VERSION=$(node -p "require('./posthog-android-surveys-compose/package.json').version")
                   SERVER_VERSION=$(node -p "require('./posthog-server/package.json').version")
                   PLUGIN_VERSION=$(node -p "require('./posthog-android-gradle-plugin/package.json').version")
 
                   sed -i "s/^coreVersion=.*/coreVersion=$CORE_VERSION/" gradle.properties
                   sed -i "s/^androidVersion=.*/androidVersion=$ANDROID_VERSION/" gradle.properties
+                  sed -i "s/^surveysComposeVersion=.*/surveysComposeVersion=$SURVEYS_COMPOSE_VERSION/" gradle.properties
                   sed -i "s/^serverVersion=.*/serverVersion=$SERVER_VERSION/" gradle.properties
                   sed -i "s/^androidPluginVersion=.*/androidPluginVersion=$PLUGIN_VERSION/" posthog-android-gradle-plugin/gradle.properties
 
+            - name: Check for version bump changes
+              id: check-changes
+              run: |
+                if [ -z "$(git status --porcelain)" ]; then
+                  echo "No changes to commit"
+                  echo "committed=false" >> "$GITHUB_OUTPUT"
+                else
+                  echo "committed=true" >> "$GITHUB_OUTPUT"
+                fi
+
             - name: Commit version bump
               id: commit-version-bump
-              run: |
-                  git add -A
-                  if git diff --staged --quiet; then
-                    echo "No changes to commit"
-                    echo "committed=false" >> "$GITHUB_OUTPUT"
-                  else
-                    git commit -m "chore: update versions and changelogs [version bump]"
-                    git push origin main
-                    echo "committed=true" >> "$GITHUB_OUTPUT"
-                  fi
+              if: steps.check-changes.outputs.committed == 'true'
+              uses: planetscale/ghcommit-action@a6b150b81dca5dd027baa898604418eec9e11465 # v0.2.22
+              with:
+                commit_message: "chore: update versions and changelogs [version bump] [skip ci]"
+                repo: ${{ github.repository }}
+                branch: main
               env:
-                  GITHUB_TOKEN: ${{ steps.releaser.outputs.token }}
-
+                GITHUB_TOKEN: ${{ steps.releaser.outputs.token }}
             - name: Notify Slack - Failed
               continue-on-error: true
               if: ${{ failure() && needs.notify-approval-needed.outputs.slack_ts != '' }}
-              uses: PostHog/.github/.github/actions/slack-thread-reply@main
+              uses: PostHog/.github/.github/actions/slack-thread-reply@5fc4680761e8ac29a61b212756230eba0e276d8c
               with:
                   slack_bot_token: ${{ secrets.SLACK_CLIENT_LIBRARIES_BOT_TOKEN }}
                   slack_channel_id: ${{ vars.SLACK_APPROVALS_CLIENT_LIBRARIES_CHANNEL_ID }}
@@ -175,7 +177,7 @@ jobs:
             - name: Notify Slack - Rejected
               if: steps.check-rejection.outputs.was_rejected == 'true'
               continue-on-error: true
-              uses: PostHog/.github/.github/actions/slack-thread-reply@main
+              uses: PostHog/.github/.github/actions/slack-thread-reply@5fc4680761e8ac29a61b212756230eba0e276d8c
               with:
                   slack_bot_token: ${{ secrets.SLACK_CLIENT_LIBRARIES_BOT_TOKEN }}
                   slack_channel_id: ${{ vars.SLACK_APPROVALS_CLIENT_LIBRARIES_CHANNEL_ID }}
@@ -197,7 +199,8 @@ jobs:
             GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
             GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         strategy:
-            fail-fast: false
+            # If any package fails to publish, stop immediately — don't publish dependents against a broken/missing dependency
+            fail-fast: true
             # Order matters: posthog (core) must be released before posthog-android and posthog-server
             # since they are transitive dependencies. We use max-parallel: 1 to enforce sequential execution.
             max-parallel: 1
@@ -213,6 +216,11 @@ jobs:
                       make_dry_target: dryReleaseAndroid
                       make_release_target: releaseAndroid
                       changelog: posthog-android/CHANGELOG.md
+                    - name: posthog-android-surveys-compose
+                      tag_prefix: surveysCompose
+                      make_dry_target: dryReleaseSurveysCompose
+                      make_release_target: releaseSurveysCompose
+                      changelog: posthog-android-surveys-compose/CHANGELOG.md
                     - name: posthog-server
                       tag_prefix: server
                       make_dry_target: dryReleaseServer
@@ -226,7 +234,7 @@ jobs:
 
         steps:
             - name: Checkout repository
-              uses: actions/checkout@v6
+              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
               with:
                   ref: main
                   fetch-depth: 0
@@ -237,7 +245,7 @@ jobs:
                   git config user.email "github-actions[bot]@users.noreply.github.com"
 
             - name: 'Set up Java 17'
-              uses: actions/setup-java@v5
+              uses: actions/setup-java@ad2b38190b15e4d6bdf0c97fb4fca8412226d287 # v5.3.0
               with:
                   java-version: '17'
                   distribution: 'temurin'
@@ -321,7 +329,7 @@ jobs:
 
             - name: Send failure event to PostHog
               if: ${{ failure() }}
-              uses: PostHog/posthog-github-action@v1
+              uses: PostHog/posthog-github-action@58dea254b598fb5d469c0699c98af8288a7f7650 # v1.2.0
               with:
                   posthog-token: '${{ secrets.POSTHOG_PROJECT_API_KEY }}'
                   event: 'posthog-android-github-release-workflow-failure'
@@ -337,7 +345,7 @@ jobs:
             - name: Notify Slack - Failed
               continue-on-error: true
               if: ${{ failure() && needs.notify-approval-needed.outputs.slack_ts != '' }}
-              uses: PostHog/.github/.github/actions/slack-thread-reply@main
+              uses: PostHog/.github/.github/actions/slack-thread-reply@5fc4680761e8ac29a61b212756230eba0e276d8c
               with:
                   slack_bot_token: ${{ secrets.SLACK_CLIENT_LIBRARIES_BOT_TOKEN }}
                   slack_channel_id: ${{ vars.SLACK_APPROVALS_CLIENT_LIBRARIES_CHANNEL_ID }}
@@ -352,11 +360,11 @@ jobs:
         if: always() && needs.publish.result == 'success' && needs.notify-approval-needed.outputs.slack_ts != ''
         steps:
             - name: Checkout repository
-              uses: actions/checkout@v6
+              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
             - name: Notify Slack - Released
               continue-on-error: true
-              uses: PostHog/.github/.github/actions/slack-thread-reply@main
+              uses: PostHog/.github/.github/actions/slack-thread-reply@5fc4680761e8ac29a61b212756230eba0e276d8c
               with:
                   slack_bot_token: ${{ secrets.SLACK_CLIENT_LIBRARIES_BOT_TOKEN }}
                   slack_channel_id: ${{ vars.SLACK_APPROVALS_CLIENT_LIBRARIES_CHANNEL_ID }}

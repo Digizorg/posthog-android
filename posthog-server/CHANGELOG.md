@@ -1,5 +1,82 @@
 ## Next
 
+## 2.7.1
+
+### Patch Changes
+
+- 125f724: Clear the feature flag called cache when closing the SDK.
+
+## 2.7.0
+
+### Minor Changes
+
+- 1965fd1: Add the ability to integrate custom caching for feature flag definitions in the server SDK.
+
+  This introduces an async-capable `PostHogFlagDefinitionCacheProvider` public API and a `PostHogBlockingFlagDefinitionCacheProvider` base class for synchronous cache backends.
+
+## 2.6.3
+
+### Patch Changes
+
+- 27f8f5f: Refactor duplicated internal code paths without changing SDK behavior.
+
+## 2.6.2
+
+### Patch Changes
+
+- 875e972: Improve public API KDoc coverage.
+
+## 2.6.1
+
+### Patch Changes
+
+- 3deea3d: Include group context in the `$feature_flag_called` LRU dedupe key so group-scoped flags fire a separate event for each group a user is evaluated under, instead of being dedup-ed against the first group context the same `(distinctId, flagKey, value)` was seen under. The groups are canonicalized order-independently so two equal maps built in different insertion orders still dedupe to one event.
+
+## 2.6.0
+
+### Minor Changes
+
+- 1aa4328: Add request-scoped context support for server-side captures, including PostHog tracing headers, session metadata, personless fallback events, and context-aware exception capture.
+
+## 2.5.3
+
+### Patch Changes
+
+- b498d90: Reject semver values with leading zeros in local flag evaluation. Per semver 2.0.0 §2, numeric identifiers must not include leading zeros — values like `1.07.3` are not valid semver and should not match targeting conditions. Both override values and flag values are now validated; invalid inputs raise `InconclusiveMatchException` so the condition does not match.
+
+## 2.5.2
+
+### Patch Changes
+
+- 27650da: Refactor `PostHogQueue` to be generic on `Record` and introduce `EndpointSpec`
+  for per-endpoint codec, send, retry policy, and runtime knobs. No behavior
+  change for events or session replay; sets up future log-record support without
+  duplicating queue plumbing.
+
+## 2.5.1
+
+### Patch Changes
+
+- e2f9884: Disable SDK setup when the API key is empty or whitespace after trimming.
+
+## 2.5.0
+
+### Minor Changes
+
+- cd5fada: Add `evaluateFlags()` API for single-call flag evaluation. Returns a `PostHogFeatureFlagEvaluations` snapshot with `isEnabled` / `getFlag` / `getFlagPayload` / `getFlagPayloadAs<T>` accessors plus `onlyAccessed()` and `only(keys)` filters. `capture()` accepts the snapshot via a new `flags` parameter to attach `$feature/<key>` properties without a second `/flags` request; user-supplied `$feature/<key>` properties win over snapshot-derived ones. `$feature_flag_called` events now include `$feature_flag_id`, `$feature_flag_version`, `$feature_flag_reason`, and propagate `$feature_flag_error` (response-level errors plus `flag_missing` for unknown keys). `flagKeys` and `disableGeoip` are forwarded to the `/flags` request body and contribute to the per-identity cache key.
+
+  Deprecates `isFeatureEnabled`, `getFeatureFlag`, `getFeatureFlagPayload`, `getFeatureFlagResult`, and `capture(appendFeatureFlags = true)` in favour of `evaluateFlags(...)`. The legacy methods keep working unchanged; Kotlin callers see a `@Deprecated` compile-time warning (silenceable with `@Suppress("DEPRECATION")`) and the `appendFeatureFlags = true` capture path emits a one-line deprecation log. Removal targets the next major.
+
+### Patch Changes
+
+- a11db4b: Remove redundant equals/hashCode from FeatureFlag-related data classes.
+
+## 2.4.1
+
+### Patch Changes
+
+- 840025b: Trim surrounding whitespace from API keys, personal API keys, and host config before using them.
+
 ## 2.4.0
 
 ### Minor Changes

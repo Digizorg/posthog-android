@@ -1,9 +1,8 @@
-package com.posthog.android
+package com.posthog
 
-import com.posthog.FeatureFlagResult
-import com.posthog.PostHogConfig
-import com.posthog.PostHogInterface
-import com.posthog.PostHogOnFeatureFlags
+import com.posthog.internal.PostHogSessionManager
+import com.posthog.logs.PostHogLogSeverity
+import com.posthog.logs.PostHogLogger
 import com.posthog.surveys.Survey
 import java.util.Date
 import java.util.UUID
@@ -14,6 +13,14 @@ public class PostHogFake : PostHogInterface {
     public var properties: Map<String, Any>? = null
     public var captures: Int = 0
     public var flushes: Int = 0
+    public var sessionReplayActive: Boolean = false
+    public var startSessionReplayCalls: Int = 0
+    public var stopSessionReplayCalls: Int = 0
+
+    // `PostHogLogger`'s constructor is `internal`. Test fixtures live in the
+    // same module, so we can construct a silent no-op here without exposing
+    // anything on the public API.
+    override val logger: PostHogLogger = PostHogLogger { _, _, _ -> }
 
     override fun <T : PostHogConfig> setup(config: T) {
     }
@@ -35,8 +42,24 @@ public class PostHogFake : PostHogInterface {
         captures++
     }
 
+    override fun captureLog(
+        message: String,
+        severity: PostHogLogSeverity,
+        attributes: Map<String, Any>?,
+        traceId: String?,
+        spanId: String?,
+        traceFlags: Int?,
+    ) {
+    }
+
     override fun captureException(
         throwable: Throwable,
+        properties: Map<String, Any>?,
+    ) {
+    }
+
+    override fun addExceptionStep(
+        message: String,
         properties: Map<String, Any>?,
     ) {
     }
@@ -67,6 +90,7 @@ public class PostHogFake : PostHogInterface {
         return null
     }
 
+    @Deprecated("Use getFeatureFlagResult() instead, which returns the flag value and payload from a single evaluation")
     override fun getFeatureFlagPayload(
         key: String,
         defaultValue: Any?,
@@ -78,6 +102,10 @@ public class PostHogFake : PostHogInterface {
         key: String,
         sendFeatureFlagEvent: Boolean?,
     ): FeatureFlagResult? {
+        return null
+    }
+
+    override fun getAllFeatureFlags(): List<FeatureFlagResult>? {
         return null
     }
 
@@ -194,27 +222,41 @@ public class PostHogFake : PostHogInterface {
         return ""
     }
 
+    override fun getAnonymousId(): String {
+        return ""
+    }
+
+    override fun getDeviceId(): String {
+        return ""
+    }
+
     override fun debug(enable: Boolean) {
     }
 
     override fun startSession() {
+        PostHogSessionManager.startSession()
     }
 
     override fun endSession() {
+        PostHogSessionManager.endSession()
     }
 
     override fun isSessionActive(): Boolean {
-        return false
+        return PostHogSessionManager.isSessionActive()
     }
 
     override fun isSessionReplayActive(): Boolean {
-        return false
+        return sessionReplayActive
     }
 
     override fun startSessionReplay(resumeCurrent: Boolean) {
+        startSessionReplayCalls++
+        sessionReplayActive = true
     }
 
     override fun stopSessionReplay() {
+        stopSessionReplayCalls++
+        sessionReplayActive = false
     }
 
     override fun getSessionId(): UUID? {

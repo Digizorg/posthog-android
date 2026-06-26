@@ -1,6 +1,7 @@
 package com.posthog
 
 import com.posthog.errortracking.PostHogErrorTrackingConfig
+import com.posthog.internal.EndpointSpec
 import com.posthog.internal.PostHogApi
 import com.posthog.internal.PostHogApiEndpoint
 import com.posthog.internal.PostHogContext
@@ -18,6 +19,7 @@ import com.posthog.internal.PostHogQueue
 import com.posthog.internal.PostHogQueueInterface
 import com.posthog.internal.PostHogRemoteConfig
 import com.posthog.internal.PostHogSerializer
+import com.posthog.logs.PostHogLogsConfig
 import com.posthog.surveys.PostHogSurveysConfig
 import okhttp3.OkHttpClient
 import java.net.Proxy
@@ -29,16 +31,16 @@ import java.util.concurrent.ExecutorService
  */
 public open class PostHogConfig(
     /**
-     * The PostHog API Key
+     * The PostHog project API key.
      */
-    public val apiKey: String,
+    apiKey: String,
     /**
      * The PostHog Host
      * Defaults to https://us.i.posthog.com
      * EU Host: https://eu.i.posthog.com
      *
      */
-    public val host: String = DEFAULT_HOST,
+    host: String = DEFAULT_HOST,
     /**
      * Logs the debug logs to the [logger] if enabled
      * Defaults to false
@@ -46,7 +48,7 @@ public open class PostHogConfig(
     public var debug: Boolean = false,
     /**
      * This flag prevents capturing any data if enabled
-     * You can overwrite this value at runtime by calling [PostHog.optIn()]] or PostHog.optOut()
+     * You can overwrite this value at runtime by calling [PostHog.optIn] or [PostHog.optOut]
      * Defaults to false
      */
     @Volatile
@@ -110,18 +112,18 @@ public open class PostHogConfig(
      * Number of minimum events before they are sent over the wire
      * Defaults to 20
      */
-    public var flushAt: Int = 20,
+    public var flushAt: Int = DEFAULT_FLUSH_AT,
     /**
      * Number of maximum events in memory and disk, when the maximum is exceed, the oldest
      * event is deleted and the new one takes place
      * Defaults to 1000
      */
-    public var maxQueueSize: Int = 1000,
+    public var maxQueueSize: Int = DEFAULT_MAX_QUEUE_SIZE,
     /**
      * Number of maximum events in a batch call
      * Defaults to 50
      */
-    public var maxBatchSize: Int = 50,
+    public var maxBatchSize: Int = DEFAULT_MAX_BATCH_SIZE,
     /**
      * Maximum number of retries for failed flush attempts before events are dropped
      * Defaults to 3
@@ -134,7 +136,7 @@ public open class PostHogConfig(
      * Defaults to 30s
      */
     @Suppress("ktlint:standard:no-consecutive-comments")
-    public var flushIntervalSeconds: Int = 30,
+    public var flushIntervalSeconds: Int = DEFAULT_FLUSH_INTERVAL_SECONDS,
     /**
      * Hook for encrypt and decrypt events
      * Devices are sandbox so likely not needed
@@ -226,6 +228,14 @@ public open class PostHogConfig(
      */
     public var surveysConfig: PostHogSurveysConfig = PostHogSurveysConfig(),
     /**
+     * Configuration for the logs subsystem. See [PostHogLogsConfig] for
+     * per-field mutability semantics — resource attributes and the
+     * `flushAt` / `maxBatchSize` knobs are snapshotted at setup; the
+     * `beforeSend` chain, `maxBufferSize`, and `flushIntervalSeconds`
+     * remain live.
+     */
+    public var logs: PostHogLogsConfig = PostHogLogsConfig(),
+    /**
      * Factory to instantiate a custom [com.posthog.internal.PostHogRemoteConfigInterface] implementation.
      */
     public val remoteConfigProvider: (
@@ -258,8 +268,22 @@ public open class PostHogConfig(
     /**
      * Factory to instantiate a custom queue implementation.
      */
-    public val queueProvider: (PostHogConfig, PostHogApi, PostHogApiEndpoint, String?, ExecutorService) -> PostHogQueueInterface =
-        { config, api, endpoint, storagePrefix, executor -> PostHogQueue(config, api, endpoint, storagePrefix, executor) },
+    @PostHogInternal
+    public val queueProvider: (
+        PostHogConfig,
+        PostHogApi,
+        PostHogApiEndpoint,
+        String?,
+        ExecutorService,
+    ) -> PostHogQueueInterface<PostHogEvent> =
+        { config, api, endpoint, storagePrefix, executor ->
+            val spec =
+                when (endpoint) {
+                    PostHogApiEndpoint.BATCH -> EndpointSpec.batch(config, api, storagePrefix)
+                    PostHogApiEndpoint.SNAPSHOT -> EndpointSpec.snapshot(config, api, storagePrefix)
+                }
+            PostHogQueue(config, spec, executor)
+        },
     /**
      * Configuration for PostHog Error Tracking feature.
      */
@@ -285,6 +309,31 @@ public open class PostHogConfig(
      */
     public var releaseIdentifier: String? = null,
 ) {
+    @Volatile
+    private var tracingHeadersList: List<String>? = null
+
+    /**
+     * When set, PostHog injects tracing headers into OkHttp requests whose destination hostname
+     * exactly matches one of the configured hostnames.
+     *
+     * Injected headers:
+     * - `X-POSTHOG-DISTINCT-ID`
+     * - `X-POSTHOG-SESSION-ID`
+     *
+     * Notes:
+     * - Requires installing [PostHogOkHttpInterceptor] on each [OkHttpClient] that should send tracing headers
+     * - Hostname matching is exact and does not include ports or subdomain wildcards
+     * - The Android SDK does not send `X-POSTHOG-WINDOW-ID` because mobile apps do not have a per-window/tab concept
+     * - Existing values for these headers will be overwritten when PostHog provides a value
+     * - Reading this property returns a snapshot
+     */
+    @get:JvmSynthetic
+    public var tracingHeaders: List<String>?
+        get() = tracingHeadersList?.let { ArrayList(it) }
+        set(value) {
+            tracingHeadersList = value?.let { ArrayList(it) }
+        }
+
     /**
      * Optional custom OkHttpClient for HTTP requests.
      *
@@ -299,6 +348,18 @@ public open class PostHogConfig(
      */
     @PostHogInternal
     public var httpClient: OkHttpClient? = null
+
+    /**
+     * The PostHog project API key, trimmed of leading and trailing whitespace.
+     */
+    public val apiKey: String = apiKey.trim()
+
+    /**
+     * The PostHog Host
+     * Defaults to https://us.i.posthog.com
+     * EU Host: https://eu.i.posthog.com
+     */
+    public val host: String = host.trim().ifBlank { DEFAULT_HOST }
 
     @PostHogInternal
     public var logger: PostHogLogger = PostHogNoOpLogger()
@@ -330,6 +391,9 @@ public open class PostHogConfig(
 
     @PostHogInternal
     public var replayStoragePrefix: String? = null
+
+    @PostHogInternal
+    public var logsStoragePrefix: String? = null
 
     @PostHogInternal
     public var cachePreferences: PostHogPreferences? = null
@@ -447,6 +511,18 @@ public open class PostHogConfig(
         }
 
     public companion object {
+        /** Shared default for [flushAt] and [PostHogLogsConfig.flushAt]. */
+        public const val DEFAULT_FLUSH_AT: Int = 20
+
+        /** Shared default for [maxBatchSize] and [PostHogLogsConfig.maxBatchSize]. */
+        public const val DEFAULT_MAX_BATCH_SIZE: Int = 50
+
+        /** Shared default for [maxQueueSize] and [PostHogLogsConfig.maxBufferSize]. */
+        public const val DEFAULT_MAX_QUEUE_SIZE: Int = 1000
+
+        /** Shared default for [flushIntervalSeconds] and [PostHogLogsConfig.flushIntervalSeconds]. */
+        public const val DEFAULT_FLUSH_INTERVAL_SECONDS: Int = 30
+
         public const val DEFAULT_US_HOST: String = "https://us.i.posthog.com"
         public const val DEFAULT_US_ASSETS_HOST: String = "https://us-assets.i.posthog.com"
 

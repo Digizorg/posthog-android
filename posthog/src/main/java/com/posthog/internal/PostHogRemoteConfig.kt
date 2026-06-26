@@ -5,6 +5,7 @@ import com.posthog.PostHogConfig
 import com.posthog.PostHogInternal
 import com.posthog.PostHogOnFeatureFlags
 import com.posthog.internal.PostHogPreferences.Companion.CAPTURE_PERFORMANCE
+import com.posthog.internal.PostHogPreferences.Companion.DEVICE_ID
 import com.posthog.internal.PostHogPreferences.Companion.ERROR_TRACKING
 import com.posthog.internal.PostHogPreferences.Companion.FEATURE_FLAGS
 import com.posthog.internal.PostHogPreferences.Companion.FEATURE_FLAGS_PAYLOAD
@@ -103,6 +104,23 @@ public class PostHogRemoteConfig(
      */
     @Volatile
     private var sessionRecordingSampleRate: Double? = null
+
+    /**
+     * Event triggers for session recording.
+     * When configured, session recording only starts after one of these events is captured.
+     * null or empty means no event triggers (record immediately if other conditions are met).
+     */
+    @Volatile
+    private var sessionRecordingEventTriggers: Set<String>? = null
+
+    /**
+     * The minimum recording duration in milliseconds.
+     * When configured, session replay snapshots are buffered locally until
+     * the session reaches this duration threshold.
+     * null or 0 means no minimum duration (send immediately).
+     */
+    @Volatile
+    private var sessionRecordingMinimumDurationMs: Long? = null
 
     init {
         preloadSessionRecordingConfig()
@@ -351,7 +369,51 @@ public class PostHogRemoteConfig(
         return value
     }
 
-    private fun processSessionRecordingConfig(sessionRecording: Any?) {
+    /**
+     * Parses event triggers from the raw value which come as a List<String> (from the API or cache).
+     * Returns null if the value is absent or empty.
+     */
+    private fun parseEventTriggers(eventTriggers: Any?): Set<String>? {
+        @Suppress("UNCHECKED_CAST")
+        val triggers = (eventTriggers as? List<String>) ?: return null
+        return triggers.takeIf { it.isNotEmpty() }?.toSet()
+    }
+
+    /**
+     * Parses and validates a minimum duration value which may come as a Number (from the API JSON)
+     * or from cached storage. Returns null if the value is absent, unparseable, or negative.
+     * The value is expected to be in milliseconds.
+     */
+    private fun parseMinimumDurationMs(raw: Any?): Long? {
+        val milliseconds: Long? =
+            when (raw) {
+                is Number -> raw.toLong()
+                is String -> raw.toLongOrNull()
+                else -> null
+            }
+        if (milliseconds != null && milliseconds < 0) {
+            config.logger.log("Remote config minimumDurationMilliseconds must be non-negative, got $milliseconds. Ignoring.")
+            return null
+        }
+        return milliseconds
+    }
+
+    // Restores the full recording config from cache (survives reset), re-evaluated against current flags.
+    private fun reevaluateSessionReplayFromCachedConfig() {
+        val recordingConfig = config.cachePreferences?.getValue(SESSION_REPLAY)
+        if (recordingConfig == null) {
+            config.logger.log("No cached session replay config to re-evaluate; replay stays disabled.")
+            return
+        }
+        processSessionRecordingConfig(recordingConfig, persist = false)
+    }
+
+    private fun processSessionRecordingConfig(
+        sessionRecording: Any?,
+        // persist=true writes the config to the cache (the /config path); false only evaluates it
+        // in-memory (the /flags re-arm path, which just read it from that same cache).
+        persist: Boolean = true,
+    ) {
         when (sessionRecording) {
             is Boolean -> {
                 // if sessionRecording is a Boolean, its always disabled
@@ -381,7 +443,13 @@ public class PostHogRemoteConfig(
 
                     sessionRecordingSampleRate = parseSampleRate(it["sampleRate"])
 
-                    config.cachePreferences?.setValue(SESSION_REPLAY, it)
+                    sessionRecordingEventTriggers = parseEventTriggers(it["eventTriggers"])
+
+                    sessionRecordingMinimumDurationMs = parseMinimumDurationMs(it["minimumDurationMilliseconds"])
+
+                    if (persist) {
+                        config.cachePreferences?.setValue(SESSION_REPLAY, it)
+                    }
 
                     // TODO:
                     // networkPayloadCapture -> Boolean or null, can also be networkPayloadCapture={recordBody=true, recordHeaders=true},
@@ -399,7 +467,10 @@ public class PostHogRemoteConfig(
         config.cachePreferences?.remove(ERROR_TRACKING)
     }
 
-    private fun processErrorTrackingConfig(errorTracking: Any?) {
+    private fun processErrorTrackingConfig(
+        errorTracking: Any?,
+        persist: Boolean = true,
+    ) {
         when (errorTracking) {
             is Boolean -> {
                 // if errorTracking is a Boolean, it's always false (disabled)
@@ -410,7 +481,9 @@ public class PostHogRemoteConfig(
                 (errorTracking as? Map<String, Any>)?.let {
                     val autocaptureExceptions = it["autocaptureExceptions"]
                     autoCaptureExceptions = autocaptureExceptions as? Boolean ?: false
-                    config.cachePreferences?.setValue(ERROR_TRACKING, it)
+                    if (persist) {
+                        config.cachePreferences?.setValue(ERROR_TRACKING, it)
+                    }
                 }
             }
             else -> {
@@ -432,12 +505,25 @@ public class PostHogRemoteConfig(
         }
     }
 
+    // Restores error tracking config from cache (survives reset); re-armed on a /flags reload.
+    private fun reevaluateErrorTrackingFromCachedConfig() {
+        val errorTracking = config.cachePreferences?.getValue(ERROR_TRACKING)
+        if (errorTracking == null) {
+            config.logger.log("No cached error tracking config to re-evaluate; autocapture stays disabled.")
+            return
+        }
+        processErrorTrackingConfig(errorTracking, persist = false)
+    }
+
     private fun clearCapturePerformance() {
         captureNetworkTiming = false
         config.cachePreferences?.remove(CAPTURE_PERFORMANCE)
     }
 
-    private fun processCapturePerformanceConfig(capturePerformance: Any?) {
+    private fun processCapturePerformanceConfig(
+        capturePerformance: Any?,
+        persist: Boolean = true,
+    ) {
         when (capturePerformance) {
             is Boolean -> {
                 // if capturePerformance is a Boolean, it's always false (disabled)
@@ -448,7 +534,9 @@ public class PostHogRemoteConfig(
                 (capturePerformance as? Map<String, Any?>)?.let {
                     val networkTiming = it["network_timing"]
                     captureNetworkTiming = networkTiming as? Boolean ?: false
-                    config.cachePreferences?.setValue(CAPTURE_PERFORMANCE, it)
+                    if (persist) {
+                        config.cachePreferences?.setValue(CAPTURE_PERFORMANCE, it)
+                    }
                 }
             }
             else -> {
@@ -468,6 +556,16 @@ public class PostHogRemoteConfig(
                 }
             }
         }
+    }
+
+    // Restores capture performance config from cache (survives reset); re-armed on a /flags reload.
+    private fun reevaluateCapturePerformanceFromCachedConfig() {
+        val capturePerformance = config.cachePreferences?.getValue(CAPTURE_PERFORMANCE)
+        if (capturePerformance == null) {
+            config.logger.log("No cached capture performance config to re-evaluate; network timing stays disabled.")
+            return
+        }
+        processCapturePerformanceConfig(capturePerformance, persist = false)
     }
 
     /**
@@ -529,10 +627,13 @@ public class PostHogRemoteConfig(
         }
 
         try {
+            val deviceId = config.cachePreferences?.getValue(DEVICE_ID) as? String
+
             val response =
                 api.flags(
                     distinctId,
                     anonymousId = anonymousId,
+                    deviceId = deviceId,
                     groups = groups,
                     personProperties = getPersonPropertiesForFlags(),
                     groupProperties = getGroupPropertiesForFlags(),
@@ -545,6 +646,12 @@ public class PostHogRemoteConfig(
                             """Feature flags are quota limited, flags could not be updated.
                                     Learn more about billing limits at https://posthog.com/docs/billing/limits-alerts""",
                         )
+                        // Flags are quota limited, but session replay / error tracking / capture
+                        // performance config come from /config (not flags), so still re-arm them from
+                        // the cache against the flags we already have, instead of leaving them disabled.
+                        reevaluateSessionReplayFromCachedConfig()
+                        reevaluateCapturePerformanceFromCachedConfig()
+                        reevaluateErrorTrackingFromCachedConfig()
                         return@let
                     }
 
@@ -583,18 +690,18 @@ public class PostHogRemoteConfig(
                         this.featureFlagPayloads = normalizedPayloads
                     }
 
-                    // since flags might have changed, we need to check if session recording is active again
-                    processSessionRecordingConfig(it.sessionRecording)
+                    // /flags carries flag evaluations only; session recording config comes from
+                    // /config. Re-arm from the cached config, re-evaluated against the new flags.
+                    reevaluateSessionReplayFromCachedConfig()
 
                     // TODO: surveys depends on remoteConfig for now
                     // otherwise surveysHandler?.onSurveysLoaded will be called multiple times
                     // processSurveys(it.surveys)
 
-                    // only process values if not yet processed by remote config
-                    if (notifyRemoteConfigLoaded) {
-                        processCapturePerformanceConfig(it.capturePerformance)
-                        processErrorTrackingConfig(it.errorTracking)
-                    }
+                    // error tracking & capture performance config come from /config, not /flags;
+                    // re-arm from the cached config like session replay above.
+                    reevaluateCapturePerformanceFromCachedConfig()
+                    reevaluateErrorTrackingFromCachedConfig()
                 }
                 config.cachePreferences?.let { preferences ->
                     val flags = this.flags ?: mapOf()
@@ -717,6 +824,10 @@ public class PostHogRemoteConfig(
                     consoleLogRecordingEnabled = sessionRecording["consoleLogRecordingEnabled"] as? Boolean ?: false
 
                     sessionRecordingSampleRate = parseSampleRate(sessionRecording["sampleRate"])
+
+                    sessionRecordingEventTriggers = parseEventTriggers(sessionRecording["eventTriggers"])
+
+                    sessionRecordingMinimumDurationMs = parseMinimumDurationMs(sessionRecording["minimumDurationMilliseconds"])
                 }
             }
         }
@@ -886,6 +997,31 @@ public class PostHogRemoteConfig(
         return flags
     }
 
+    /**
+     * Returns the sorted keys of currently-active feature flags, or `null`
+     * if flags haven't loaded. "Active" matches the events-side filter at
+     * [com.posthog.PostHog.buildProperties]: boolean flags are active iff
+     * `true`; non-boolean (multivariant) flags are always active.
+     *
+     * Faster than [getFeatureFlags] for callers that only need the key set
+     * (e.g. log records) — filters inside the existing lock without copying
+     * the value side of the map.
+     */
+    public fun getActiveFeatureFlagKeys(): List<String>? {
+        val keys: MutableList<String> =
+            synchronized(featureFlagsLock) {
+                val flags = featureFlags ?: return null
+                val acc = ArrayList<String>(flags.size)
+                for ((key, value) in flags) {
+                    val active = value as? Boolean ?: true
+                    if (active) acc.add(key)
+                }
+                acc
+            }
+        keys.sort()
+        return keys
+    }
+
     public fun isSessionReplayFlagActive(): Boolean = sessionReplayFlagActive
 
     /**
@@ -919,6 +1055,26 @@ public class PostHogRemoteConfig(
      * Returns the current session recording sample rate, or null if not set.
      */
     public fun getSessionRecordingSampleRate(): Double? = sessionRecordingSampleRate
+
+    /**
+     * Returns the current event triggers for session recording, or null if not configured.
+     * When event triggers are configured, session recording only starts after one of these events is captured.
+     *
+     * React Native evaluates event triggers in its JS layer; RN-captured events never reach the
+     * native capture() pipeline, so the native gate can't be satisfied. Returns null for RN — the
+     * JS layer owns them (linkedFlag and sampling gates still apply).
+     */
+    public fun getEventTriggers(): Set<String>? {
+        if (PostHogSessionManager.isReactNative) return null
+        return sessionRecordingEventTriggers
+    }
+
+    /**
+     * Returns the current minimum recording duration in milliseconds, or null if not set.
+     * When set, session replay snapshots should be buffered until the session
+     * reaches this duration.
+     */
+    public fun getRecordingMinimumDurationMs(): Long? = sessionRecordingMinimumDurationMs
 
     override fun getRequestId(
         distinctId: String?,
@@ -1021,7 +1177,8 @@ public class PostHogRemoteConfig(
         }
     }
 
-    private fun getPersonPropertiesForFlags(): Map<String, Any> {
+    @PostHogInternal
+    public fun getPersonPropertiesForFlags(): Map<String, Any> {
         synchronized(personPropertiesForFlagsLock) {
             val properties = mutableMapOf<String, Any>()
 
@@ -1081,15 +1238,17 @@ public class PostHogRemoteConfig(
         }
 
         synchronized(remoteConfigLock) {
-            clearSurveys()
-            clearErrorTracking()
-            clearCapturePerformance()
+            // Zero error tracking / capture performance in memory (cache kept so a reload re-arms them).
+            // Surveys are kept entirely — they don't depend on flags, so no re-arm is needed.
+            autoCaptureExceptions = false
+            captureNetworkTiming = false
         }
 
         // Clear person and group properties for flags
         resetPersonPropertiesForFlags()
         resetGroupPropertiesForFlags()
 
-        config.cachePreferences?.remove(SESSION_REPLAY)
+        // SESSION_REPLAY, ERROR_TRACKING, CAPTURE_PERFORMANCE, and SURVEYS are intentionally kept
+        // (project-level, not user data) so each survives a reset without an app restart.
     }
 }

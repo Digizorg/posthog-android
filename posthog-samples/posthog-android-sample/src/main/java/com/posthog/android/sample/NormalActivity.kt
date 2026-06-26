@@ -1,5 +1,6 @@
 package com.posthog.android.sample
 
+import android.content.Intent
 import android.os.Bundle
 import android.widget.Button
 import android.widget.Toast
@@ -20,36 +21,35 @@ class NormalActivity : ComponentActivity() {
 
         setContentView(R.layout.normal_activity)
 
-//        val webview = findViewById<WebView>(R.id.webview)
-//        webview.loadUrl("https://www.google.com")
+        findViewById<Button>(R.id.sessionReplayButton).setOnClickListener {
+            startActivity(Intent(this, SessionReplayActivity::class.java))
+        }
 
-        val button = findViewById<Button>(R.id.button)
-//        val editText = findViewById<EditText>(R.id.editText)
-//        val imvAndroid = findViewById<ImageView>(R.id.imvAndroid)
-        button.setOnClickListener {
-//            Log.e("MyApp", "Clicked on button ${button.text}")
-//            button.text = "Test: ${(0..10).random()}"
-//            if (imvAndroid.visibility == View.VISIBLE) {
-//                imvAndroid.visibility = View.GONE
-//            } else {
-//                imvAndroid.visibility = View.VISIBLE
-//            }
-//            startActivity(Intent(this, NothingActivity::class.java))
-//            finish()
-            // Check if the "enable_network_request" feature flag is enabled
+        findViewById<Button>(R.id.logsButton).setOnClickListener {
+            startActivity(Intent(this, LogsActivity::class.java))
+        }
 
-//            var str: String? = null
-//            if (str!!.startsWith("")) {
-//                str = "123"
-//                Toast.makeText(this, str, Toast.LENGTH_SHORT).show()
-//            }
-//            val doSomething = DoSomething()
-//            doSomething.doSomethingNow()
+        findViewById<Button>(R.id.errorTrackingButton).setOnClickListener {
+            // Screen for recording exception steps and capturing manual/fatal exceptions.
+            startActivity(Intent(this, ErrorTrackingActivity::class.java))
+        }
 
+        findViewById<Button>(R.id.triggerSurveyButton).setOnClickListener {
+            // Fires the event a Popover survey can be targeted on (event = "show_survey_trigger").
+            PostHog.capture("show_survey_trigger")
+            Toast.makeText(this, "Captured show_survey_trigger", Toast.LENGTH_SHORT).show()
+        }
+
+        findViewById<Button>(R.id.openComposeHostButton).setOnClickListener {
+            // Compose-hosted screen with one survey-trigger button per question type.
+            startActivity(Intent(this, SurveysComposeActivity::class.java))
+        }
+
+        findViewById<Button>(R.id.button).setOnClickListener {
+            // Makes a network request (captured by PostHogOkHttpInterceptor) when the
+            // "enable_network_request" feature flag is on.
             val isNetworkRequestEnabled = PostHog.isFeatureEnabled("enable_network_request", false)
-
             if (isNetworkRequestEnabled) {
-                // Make the network request
                 Thread {
                     try {
                         client.newCall(
@@ -57,21 +57,21 @@ class NormalActivity : ComponentActivity() {
                                 .url("https://google.com")
                                 .build(),
                         ).execute().closeQuietly()
-
-                        // Show success message on the main thread
                         runOnUiThread {
                             Toast.makeText(this, "Network request successful!", Toast.LENGTH_SHORT).show()
                         }
                     } catch (e: Exception) {
-                        // Show error message on the main thread
                         runOnUiThread {
                             Toast.makeText(this, "Network request failed: ${e.message}", Toast.LENGTH_SHORT).show()
                         }
                     }
                 }.start()
             } else {
-                // Show message that feature is disabled
-                Toast.makeText(this, "Network requests are disabled by feature flag: `enable_network_request`", Toast.LENGTH_SHORT).show()
+                Toast.makeText(
+                    this,
+                    "Network requests are disabled by feature flag: `enable_network_request`",
+                    Toast.LENGTH_SHORT,
+                ).show()
             }
         }
     }

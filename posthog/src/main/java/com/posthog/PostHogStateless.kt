@@ -39,7 +39,7 @@ public open class PostHogStateless protected constructor(
     protected var config: PostHogConfig? = null
 
     protected var featureFlags: PostHogFeatureFlagsInterface? = null
-    protected var queue: PostHogQueueInterface? = null
+    protected var queue: PostHogQueueInterface<PostHogEvent>? = null
     protected var memoryPreferences: PostHogPreferences = PostHogMemoryPreferences()
     protected val throwableCoercer: ThrowableCoercer = ThrowableCoercer()
 
@@ -52,6 +52,11 @@ public open class PostHogStateless protected constructor(
                 }
                 config.logger =
                     if (config.logger is PostHogNoOpLogger) PostHogPrintLogger(config) else config.logger
+
+                if (config.apiKey.isEmpty()) {
+                    config.logger.log("PostHog SDK is disabled because the API key is required and was empty after trimming whitespace.")
+                    return
+                }
 
                 if (!apiKeys.add(config.apiKey)) {
                     config.logger.log("API Key: ${config.apiKey} already has a PostHog instance.")
@@ -122,6 +127,7 @@ public open class PostHogStateless protected constructor(
 
                 queue?.stop()
                 featureFlags?.shutDown()
+                featureFlagsCalled?.clear()
             } catch (e: Throwable) {
                 config?.logger?.log("Close failed: $e.")
             }
@@ -438,28 +444,52 @@ public open class PostHogStateless protected constructor(
         sendFeatureFlagEvent: Boolean? = null,
     ) {
         val effectiveSendFeatureFlagEvent = sendFeatureFlagEvent ?: config?.sendFeatureFlagEvent ?: true
-        if (effectiveSendFeatureFlagEvent) {
-            val isNewlySeen = featureFlagsCalled?.add(distinctId, key, value) ?: false
-            if (isNewlySeen) {
-                val requestId = featureFlags?.getRequestId(distinctId, groups, personProperties, groupProperties)
-                val evaluatedAt = featureFlags?.getEvaluatedAt(distinctId, groups, personProperties, groupProperties)
+        if (!effectiveSendFeatureFlagEvent) return
 
-                val props = mutableMapOf<String, Any>()
-                props["\$feature_flag"] = key
-                props["\$feature_flag_response"] = value ?: ""
-                requestId?.let { props["\$feature_flag_request_id"] = it }
-                evaluatedAt?.let { props["\$feature_flag_evaluated_at"] = it }
-                featureFlags?.getFeatureFlagError(
-                    key,
-                    distinctId,
-                    groups,
-                    personProperties,
-                    groupProperties,
-                )?.let { props["\$feature_flag_error"] = it }
-
-                captureStateless(PostHogEventName.FEATURE_FLAG_CALLED.event, distinctId, properties = props)
-            }
+        val props = mutableMapOf<String, Any>()
+        featureFlags?.getRequestId(distinctId, groups, personProperties, groupProperties)
+            ?.let { props["\$feature_flag_request_id"] = it }
+        featureFlags?.getEvaluatedAt(distinctId, groups, personProperties, groupProperties)
+            ?.let { props["\$feature_flag_evaluated_at"] = it }
+        featureFlags?.getFeatureFlagError(key, distinctId, groups, personProperties, groupProperties)
+            ?.let { props["\$feature_flag_error"] = it }
+        featureFlags?.getFeatureFlagDetails(key, distinctId, groups, personProperties, groupProperties)?.let { details ->
+            props["\$feature_flag_id"] = details.metadata.id
+            props["\$feature_flag_version"] = details.metadata.version
+            details.reason?.description?.let { props["\$feature_flag_reason"] = it }
         }
+
+        captureFeatureFlagCalledEvent(distinctId, key, value, props, groups)
+    }
+
+    /**
+     * Shared dedup-and-capture path for `$feature_flag_called`. Callers pass a pre-built properties
+     * map and are responsible for whatever per-call gate they care about; this helper only enforces
+     * the per-distinct-id dedup and routes through the queue. Both the existing per-flag accessor
+     * (after applying its `sendFeatureFlagEvent` override) and the new feature-flag-evaluations
+     * snapshot (after checking its own config) funnel through here so dedup stays uniform.
+     *
+     * `groups` is mixed into the dedup key so group-scoped flags fire a separate event for each
+     * group a user is evaluated under, instead of dedup-ing across groups.
+     */
+    @PostHogInternal
+    @JvmOverloads
+    protected fun captureFeatureFlagCalledEvent(
+        distinctId: String,
+        key: String,
+        value: Any?,
+        properties: Map<String, Any>,
+        groups: Map<String, String>? = null,
+    ) {
+        val isNewlySeen = featureFlagsCalled?.add(distinctId, key, value, groups) ?: false
+        if (!isNewlySeen) return
+
+        val props = mutableMapOf<String, Any>()
+        props.putAll(properties)
+        props["\$feature_flag"] = key
+        props["\$feature_flag_response"] = value ?: ""
+
+        captureStateless(PostHogEventName.FEATURE_FLAG_CALLED.event, distinctId, properties = props, groups = groups)
     }
 
     public override fun getFeatureFlagStateless(
@@ -600,9 +630,10 @@ public open class PostHogStateless protected constructor(
         }
 
         /**
-         * Set up the SDK and returns an instance that you can hold and pass it around
-         * @param T the type of the Config
-         * @property config the Config
+         * Sets up the stateless SDK and returns an instance that you can hold and pass around.
+         *
+         * @param config SDK configuration.
+         * @return The configured stateless PostHog client instance.
          */
         public fun <T : PostHogConfig> with(config: T): PostHogStatelessInterface {
             val instance = PostHogStateless()

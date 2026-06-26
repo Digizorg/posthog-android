@@ -1,5 +1,210 @@
 ## Next
 
+## 3.51.2
+
+### Patch Changes
+
+- f418d41: Allow the posthog-kmp wrapper SDK to keep its own `sdkName`/`sdkVersion` so KMP events report the correct `$lib`/version, mirroring how posthog-flutter and posthog-react-native are handled.
+
+## 3.51.1
+
+### Patch Changes
+
+- 8f75572: Session replay: skip native event-trigger gating when running under React Native (`sdkName == "posthog-react-native"`). `PostHogRemoteConfig.getEventTriggers()` returns null for RN, so the native recorder no longer self-gates and `startSessionReplay` records as instructed. React Native evaluates `sessionRecording.eventTriggers` in its JS layer and drives recording explicitly; the native gate could never be satisfied because JS-captured events never reach the native capture pipeline, so event-triggered replay never recorded on RN. The linked-flag and sampling gates are unchanged, and non-RN behavior is unaffected.
+
+## 3.51.0
+
+### Minor Changes
+
+- d64ad52: Add `addExceptionStep(message, properties?)` and the `errorTrackingConfig.exceptionSteps` config (enabled by default, 32 KiB byte budget). Recorded steps are buffered in a rolling, byte-bounded FIFO and attached to every captured `$exception` event as `$exception_steps`.
+
+## 3.50.0
+
+### Minor Changes
+
+- e227aa5: Expose `getAnonymousId()` on `PostHogInterface`. Returns the anonymous ID generated before any `identify()` call — unlike `distinctId()`, this does not change after identification.
+
+## 3.49.1
+
+### Patch Changes
+
+- 52c9094: Deprecate `getFeatureFlagPayload` in favor of `getFeatureFlagResult`, which returns the flag value and payload from a single evaluation. `getFeatureFlagPayload` continues to work.
+
+## 3.49.0
+
+### Minor Changes
+
+- 8632f77: Surveys now have a ready-made UI on Android. Add the new optional
+  `com.posthog:posthog-android-surveys-compose` module alongside `posthog-android` and set
+  `surveys = true` — the SDK auto-discovers the Compose UI and renders surveys with no extra wiring.
+
+  The UI is a Material 3 modal bottom sheet presented in its own window above your foreground
+  activity, so it works over both XML and Jetpack Compose apps and never interferes with your app's
+  navigation. It covers all survey question types (open text, single / multiple choice, number /
+  NPS rating, emoji rating, thumbs up/down, link) plus the thank-you screen, multi-question
+  server-driven branching, the configured popup delay, and theming from your PostHog appearance
+  settings.
+
+  Until now the default delegate only logged; you can still provide your own
+  `PostHogSurveysDelegate` for a custom UI. The module is pre-1.0 (`0.x`).
+
+## 3.48.0
+
+### Minor Changes
+
+- 3203bda: Add a public `captureLog()` API for capturing logs with optional W3C trace correlation (`traceId`/`spanId`/`traceFlags`), matching iOS, web, and React Native. The `logger` facade is unchanged.
+
+## 3.47.4
+
+### Patch Changes
+
+- 0bde688: Keep surveys loaded after an in-session `identify()`/`reset()` instead of clearing them until the next app restart.
+
+## 3.47.3
+
+### Patch Changes
+
+- 27f8f5f: Refactor duplicated internal code paths without changing SDK behavior.
+
+## 3.47.2
+
+### Patch Changes
+
+- 1a60d00: Keep session replay, error tracking, and network performance capture active after an in-session `identify()`/`reset()` instead of disabling them until the next app restart.
+
+## 3.47.1
+
+### Patch Changes
+
+- 875e972: Improve public API KDoc coverage.
+
+## 3.47.0
+
+### Minor Changes
+
+- 8d11398: Add public Logs API: `PostHog.logger.trace/debug/info/warn/error/fatal(message, attrs?)` plus a `PostHogLogsConfig` for serviceName, environment, resourceAttributes, rate cap, and `addBeforeSend` redaction hooks. Logs ship via OTLP/JSON to `/i/v1/logs` and pick up auto-attached attributes (`app.state`, distinctId, sessionId, screen name, feature flags). Matches the equivalent surfaces on posthog-ios and posthog-react-native.
+- 8d11398: Auto-attach `$screen_name` to every captured event after `PostHog.screen()` has been called (manually or via Activity-lifecycle auto-capture). Cached value is cleared by `reset()` and `close()`.
+
+  **To opt out of `$screen_name` stamping entirely**, set `PostHogAndroidConfig.captureScreenViews = false` **and** stop calling `PostHog.screen()` manually. Disabling `captureScreenViews` alone is not sufficient — a single manual `PostHog.screen("Home")` call will re-enable stamping.
+
+## 3.46.0
+
+### Minor Changes
+
+- 09f86a6: Add public Logs API: `PostHog.logger.trace/debug/info/warn/error/fatal(message, attrs?)` plus a `PostHogLogsConfig` for serviceName, environment, resourceAttributes, rate cap, and `addBeforeSend` redaction hooks. Logs ship via OTLP/JSON to `/i/v1/logs` and pick up auto-attached attributes (`app.state`, distinctId, sessionId, screen name, feature flags). Matches the equivalent surfaces on posthog-ios and posthog-react-native.
+
+## 3.45.1
+
+### Patch Changes
+
+- 3cd4742: Fix session replay screenshots being dropped on screens with continuous animations (e.g. Lottie).
+  Previously, any `onDraw` callback received while PixelCopy was in flight caused the screenshot to be discarded. Introduces `isOnlyAnimationRedraw` to distinguish animation-driven redraws from structural layout changes.
+  Uses `View.hasTransientState()` on the decor view, which Android propagates up from any animating descendant, as the signal.
+
+## 3.45.0
+
+### Minor Changes
+
+- 2282895: Add survey translations support. Surveys can carry per-language overrides for user-visible strings via a `translations` map keyed by language code. At display time the SDK resolves a language (init override → person property `"language"` → device locale), applies any matching translation onto the display model, and stamps the matched key as `$survey_language` on every survey event when a translation actually took effect.
+
+  Configure via `PostHogSurveysConfig.overrideDisplayLanguage`. Matching is case-insensitive with a base-language fallback (e.g. `"pt-BR"` falls back to `"pt"`).
+
+## 3.44.2
+
+### Patch Changes
+
+- 27650da: Refactor `PostHogQueue` to be generic on `Record` and introduce `EndpointSpec`
+  for per-endpoint codec, send, retry policy, and runtime knobs. No behavior
+  change for events or session replay; sets up future log-record support without
+  duplicating queue plumbing.
+
+## 3.44.1
+
+### Patch Changes
+
+- e2f9884: Disable SDK setup when the API key is empty or whitespace after trimming.
+
+## 3.44.0
+
+### Minor Changes
+
+- 006f5d0: feat: support session replay minimum recording duration
+
+## 3.43.3
+
+### Patch Changes
+
+- 3a2a1ec: Stop mutating user-supplied `PostHogConfig.maxBatchSize` and `PostHogConfig.flushAt` when the events queue adapts to HTTP 413 responses. The adaptive cap is now kept in private queue state, halved from the actual batch size that triggered the 413, and `flushAt` is clamped to the cap so a partial-batch 413 can't leave the queue buffering more events than a single batch can drain.
+
+## 3.43.2
+
+### Patch Changes
+
+- 590d694: Enforce 24-hour maximum session duration and 30-minute inactivity rotation with automatic session rotation, mirroring iOS. Note: `PostHogSessionManager.isAppInBackground` now defaults to `true` until the first lifecycle `onStart` flips it; downstream wrappers (Flutter, RN) that exercise the manager directly in tests may need to call `setAppInBackground(false)` to simulate a foregrounded process.
+
+## 3.43.1
+
+### Patch Changes
+
+- ed31712: Include survey responses on Android dismissal events, including question id based response keys and partial completion state. Null rating responses are ignored instead of being serialized as "null".
+
+## 3.43.0
+
+### Minor Changes
+
+- fbb5a25: Add tracing header support for Android OkHttp requests.
+
+## 3.42.1
+
+### Patch Changes
+
+- 840025b: Trim surrounding whitespace from API keys, personal API keys, and host config before using them.
+
+## 3.42.0
+
+### Minor Changes
+
+- 8b447c1: Attach release info (`applicationId`, `versionName`, `versionCode`) to proguard mapping uploads via the new posthog-cli `--release-name`, `--release-version`, and `--build` flags.
+- 3a0b654: add getAllFeatureFlags support
+
+## 3.41.0
+
+### Minor Changes
+
+- 6fbdcd5: feat: add device bucketing support for stable feature flag assignment across identity changes
+
+## 3.40.2
+
+### Patch Changes
+
+- 2c3101a: Ignore `isLaidOut` checks for React Native session replay.
+
+## 3.40.1
+
+### Patch Changes
+
+- a22edb0: fix: failing posthog-core release
+
+## 3.40.0
+
+### Minor Changes
+
+- f3edb25: feat: add support for session replay event triggers
+
+> ⚠️ Warning: com.posthog:posthog:6.10.0 failed to publish to Maven Central which broke this release. Please skip to 3.40.1.
+
+## 3.39.2
+
+### Patch Changes
+
+- 19d363d: fix: exclude API-type surveys from auto-display
+
+## 3.39.1
+
+### Patch Changes
+
+- d9b7bd4: fix: session replay callback parameters were swapped, causing throttling to not work correctly and stopSessionRecording() to appear broken
+
 ## 3.39.0
 
 ### Minor Changes
@@ -515,7 +720,7 @@ config.proxy = Proxy(Proxy.Type.HTTP, InetSocketAddress("proxy.example.com",8080
 
 - chore: Add mutations support to Session Recording ([#72](https://github.com/PostHog/posthog-android/pull/72))
 - chore: Session Recording as Experimental preview
-  - Check out the [USAGE](https://github.com/PostHog/posthog-android/blob/main/USAGE.md#android-session-recording) guide.
+  - Check out the [docs](https://posthog.com/docs/session-replay/mobile) guide.
 
 ## 3.0.1 - 2024-01-03
 
@@ -529,13 +734,13 @@ config.proxy = Proxy(Proxy.Type.HTTP, InetSocketAddress("proxy.example.com",8080
 
 - Android Session Recording - Alpha preview ([#69](https://github.com/PostHog/posthog-android/pull/69))
 
-Check out the [USAGE](https://github.com/PostHog/posthog-android/blob/main/USAGE.md#android-session-recording) guide.
+Check out the [docs](https://posthog.com/docs/session-replay/mobile) guide.
 
 ## 3.0.0 - 2023-12-06
 
 Check out the updated [docs](https://posthog.com/docs/libraries/android).
 
-Check out the [USAGE](https://github.com/PostHog/posthog-android/blob/main/USAGE.md) guide.
+Check out the [docs](https://posthog.com/docs/libraries/android) guide.
 
 ### Changes
 

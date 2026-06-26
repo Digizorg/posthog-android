@@ -1,4 +1,6 @@
-// adapted from https://github.com/getsentry/sentry-android-gradle-plugin/blob/0ce926822756c8379e281bed8c33237a400c9582/plugin-build/src/main/kotlin/io/sentry/android/gradle/SentryPlugin.kt#L9
+// Portions of this file are derived from getsentry/sentry-android-gradle-plugin
+// Copyright (c) 2020 Sentry
+// Licensed under the MIT License: https://github.com/getsentry/sentry-android-gradle-plugin/blob/main/LICENSE
 
 package com.posthog.android
 
@@ -96,7 +98,7 @@ internal class PostHogAndroidGradlePlugin : Plugin<Project> {
                 mappingFiles = variant.mappingFileProvider(project),
             )
 
-        generateMapIdTask.hookWithMinifyTasks(project, variant.name)
+        generateMapIdTask.hookWithMinifyTasks(project, variant.name, generateMapIdTask)
 
         uploadMapIdTask.hookWithAssembleTasks(project, variant)
 
@@ -109,12 +111,16 @@ internal class PostHogAndroidGradlePlugin : Plugin<Project> {
         variant: ApplicationVariant,
         mappingFiles: Provider<FileCollection>,
     ): TaskProvider<PostHogUploadProguardMappingsTask> {
+        val primaryOutput = variant.outputs.firstOrNull()
         val uploadMapIdTask =
             PostHogUploadProguardMappingsTask.register(
                 project = project,
                 generateMapIdTask = generateMapIdTask,
                 mappingFiles = mappingFiles,
                 taskSuffix = variant.name.capitalizeUS(),
+                releaseName = variant.applicationId,
+                releaseVersion = primaryOutput?.versionName?.map { it.orEmpty() },
+                build = primaryOutput?.versionCode,
             )
         return uploadMapIdTask
     }

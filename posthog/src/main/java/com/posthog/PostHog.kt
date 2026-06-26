@@ -1,6 +1,7 @@
 package com.posthog
 
 import com.posthog.errortracking.PostHogErrorTrackingAutoCaptureIntegration
+import com.posthog.internal.EndpointSpec
 import com.posthog.internal.PostHogApi
 import com.posthog.internal.PostHogApiEndpoint
 import com.posthog.internal.PostHogDefaultPersonPropertiesProvider
@@ -10,24 +11,34 @@ import com.posthog.internal.PostHogOnRemoteConfigLoaded
 import com.posthog.internal.PostHogPreferences.Companion.ALL_INTERNAL_KEYS
 import com.posthog.internal.PostHogPreferences.Companion.ANONYMOUS_ID
 import com.posthog.internal.PostHogPreferences.Companion.BUILD
+import com.posthog.internal.PostHogPreferences.Companion.CAPTURE_PERFORMANCE
+import com.posthog.internal.PostHogPreferences.Companion.DEVICE_ID
 import com.posthog.internal.PostHogPreferences.Companion.DISTINCT_ID
+import com.posthog.internal.PostHogPreferences.Companion.ERROR_TRACKING
 import com.posthog.internal.PostHogPreferences.Companion.GROUPS
 import com.posthog.internal.PostHogPreferences.Companion.IS_IDENTIFIED
 import com.posthog.internal.PostHogPreferences.Companion.OPT_OUT
 import com.posthog.internal.PostHogPreferences.Companion.PERSON_PROCESSING
+import com.posthog.internal.PostHogPreferences.Companion.SESSION_REPLAY
+import com.posthog.internal.PostHogPreferences.Companion.SURVEYS
 import com.posthog.internal.PostHogPreferences.Companion.VERSION
 import com.posthog.internal.PostHogPrintLogger
+import com.posthog.internal.PostHogQueue
 import com.posthog.internal.PostHogQueueInterface
 import com.posthog.internal.PostHogRemoteConfig
 import com.posthog.internal.PostHogSendCachedEventsIntegration
 import com.posthog.internal.PostHogSerializer
 import com.posthog.internal.PostHogSessionManager
 import com.posthog.internal.PostHogThreadFactory
+import com.posthog.internal.errortracking.PostHogExceptionStepsBuffer
 import com.posthog.internal.personPropertiesContext
 import com.posthog.internal.replay.PostHogSessionReplayHandler
 import com.posthog.internal.sortMapRecursively
 import com.posthog.internal.surveys.PostHogSurveyHelper
 import com.posthog.internal.surveys.PostHogSurveysHandler
+import com.posthog.logs.PostHogLogRecord
+import com.posthog.logs.PostHogLogSeverity
+import com.posthog.logs.PostHogLogger
 import com.posthog.surveys.Survey
 import com.posthog.vendor.uuid.TimeBasedEpochGenerator
 import java.util.Date
@@ -44,6 +55,10 @@ public class PostHog private constructor(
         Executors.newSingleThreadScheduledExecutor(
             PostHogThreadFactory("PostHogReplayQueueThread"),
         ),
+    private val logsExecutor: ExecutorService =
+        Executors.newSingleThreadScheduledExecutor(
+            PostHogThreadFactory("PostHogLogsQueueThread"),
+        ),
     private val remoteConfigExecutor: ExecutorService =
         Executors.newSingleThreadScheduledExecutor(
             PostHogThreadFactory("PostHogRemoteConfigThread"),
@@ -55,6 +70,7 @@ public class PostHog private constructor(
     private val reloadFeatureFlags: Boolean = true,
 ) : PostHogInterface, PostHogStateless() {
     private val anonymousLock = Any()
+    private val deviceIdLock = Any()
     private val identifiedLock = Any()
     private val groupsLock = Any()
     private val personProcessingLock: Any = Any()
@@ -62,7 +78,36 @@ public class PostHog private constructor(
     private val featureFlagsCalledLock = Any()
     private val cachedPersonPropertiesLock = Any()
 
-    private var replayQueue: PostHogQueueInterface? = null
+    private var replayQueue: PostHogQueueInterface<PostHogEvent>? = null
+
+    private var logsQueue: PostHogQueueInterface<PostHogLogRecord>? = null
+
+    /**
+     * Captures application log records into PostHog's logs product
+     * (separate from product analytics events). Use the severity-specific
+     * helpers (`trace`/`debug`/`info`/`warn`/`error`/`fatal`) or the
+     * generic [PostHogLogger.log].
+     *
+     * ```kotlin
+     * PostHog.logger.info("checkout opened")
+     * PostHog.logger.error("payment failed", mapOf("code" to "PAY_3001"))
+     * ```
+     *
+     * Not to be confused with the internal `config.logger` debug sink.
+     */
+    public override val logger: PostHogLogger =
+        PostHogLogger { message, severity, attributes ->
+            captureLogInternal(message, severity, attributes, traceId = null, spanId = null, traceFlags = null)
+        }
+
+    @Volatile
+    private var lastScreenName: String? = null
+
+    // Logs rate-cap state. Tumbling window: when wall-clock time advances
+    // past windowStartMillis + window, the counter resets to 1.
+    private val logsRateCapLock = Any()
+    private var logsRateCapWindowStartMillis: Long = 0
+    private var logsRateCapWindowCount: Int = 0
 
     private val remoteConfig: PostHogRemoteConfig?
         get() = config?.remoteConfigHolder
@@ -74,6 +119,9 @@ public class PostHog private constructor(
 
     private var sessionReplayHandler: PostHogSessionReplayHandler? = null
     private var surveysHandler: PostHogSurveysHandler? = null
+
+    @Volatile
+    private var exceptionStepsBuffer: PostHogExceptionStepsBuffer? = null
 
     private var isIdentifiedLoaded: Boolean = false
     private var isPersonProcessingLoaded: Boolean = false
@@ -99,6 +147,11 @@ public class PostHog private constructor(
                 config.logger =
                     if (config.logger is PostHogNoOpLogger) PostHogPrintLogger(config) else config.logger
 
+                if (config.apiKey.isEmpty()) {
+                    config.logger.log("PostHog SDK is disabled because the API key is required and was empty after trimming whitespace.")
+                    return
+                }
+
                 if (!apiKeys.add(config.apiKey)) {
                     config.logger.log("API Key: ${config.apiKey} already has a PostHog instance.")
                 }
@@ -121,6 +174,17 @@ public class PostHog private constructor(
                         PostHogApiEndpoint.SNAPSHOT,
                         config.replayStoragePrefix,
                         replayExecutor,
+                    )
+                // The events/snapshot queueProvider is intentionally kept
+                // PostHogEvent-typed; logs have a different record type and
+                // no `wrap me` extension point analogous to replay, so the
+                // queue is constructed directly here rather than threading a
+                // second generic through PostHogConfig.
+                val logsQueue =
+                    PostHogQueue(
+                        config,
+                        EndpointSpec.logs(config, api, config.logsStoragePrefix),
+                        logsExecutor,
                     )
                 val onRemoteConfigLoaded =
                     PostHogOnRemoteConfigLoaded {
@@ -167,6 +231,21 @@ public class PostHog private constructor(
                 this.config = config
                 this.queue = queue
                 this.replayQueue = replayQueue
+                this.logsQueue = logsQueue
+
+                if (config.errorTrackingConfig.exceptionSteps.enabled) {
+                    val maxBytes = config.errorTrackingConfig.exceptionSteps.maxBytes
+                    if (maxBytes > 0) {
+                        exceptionStepsBuffer =
+                            PostHogExceptionStepsBuffer(
+                                maxBytes = maxBytes,
+                                serializer = config.serializer,
+                                logger = config.logger,
+                            )
+                    } else {
+                        config.logger.log("Exception steps disabled: maxBytes ($maxBytes) must be greater than 0.")
+                    }
+                }
 
                 if (featureFlags is PostHogRemoteConfig) {
                     config.remoteConfigHolder = featureFlags
@@ -179,7 +258,21 @@ public class PostHog private constructor(
 
                 super.enabled = true
 
+                // Initialize device_id if not already set. getDeviceId() handles lazy init
+                // by seeding from the anonymous ID, providing a stable identifier for
+                // device-level feature flag bucketing that survives identify() and reset().
+                getDeviceId()
+
                 queue.start()
+                logsQueue.start()
+
+                PostHogSessionManager.setOnSessionIdChangedListener {
+                    try {
+                        sessionReplayHandler?.onSessionIdChanged()
+                    } catch (e: Throwable) {
+                        config.logger.log("onSessionIdChanged listener failed: $e.")
+                    }
+                }
 
                 startSession()
 
@@ -296,8 +389,15 @@ public class PostHog private constructor(
 
                 queue?.stop()
                 replayQueue?.stop()
+                logsQueue?.stop()
 
                 featureFlagsCalled.clear()
+                lastScreenName = null
+
+                PostHogSessionManager.setOnSessionIdChangedListener(null)
+
+                exceptionStepsBuffer?.clear()
+                exceptionStepsBuffer = null
 
                 endSession()
             } catch (e: Throwable) {
@@ -306,6 +406,7 @@ public class PostHog private constructor(
         }
     }
 
+    @get:JvmName("getAnonymousIdInternal")
     private var anonymousId: String
         get() {
             var anonymousId: String?
@@ -415,6 +516,7 @@ public class PostHog private constructor(
 
             props["\$is_identified"] = isIdentified
             props["\$process_person_profile"] = hasPersonProcessing()
+            stampCachedScreenName(props)
         }
 
         // Session replay should have the SDK info as well
@@ -424,8 +526,14 @@ public class PostHog private constructor(
 
         val isSessionReplayActive = isSessionReplayActive()
 
-        PostHogSessionManager.getActiveSessionId()?.let { sessionId ->
-            val tempSessionId = sessionId.toString()
+        // Skip the getter when caller pre-attached an id: getActiveSessionId() can
+        // silently rotate, and the caller's value wins via putAll either way.
+        val propSessionId = properties?.get("\$session_id") as? String
+        val sessionIdString =
+            propSessionId?.takeIf { it.isNotBlank() }
+                ?: PostHogSessionManager.getActiveSessionId()?.toString()
+
+        sessionIdString?.let { tempSessionId ->
             props["\$session_id"] = tempSessionId
             // only Session replay needs $window_id
             if (!appendSharedProps && isSessionReplayActive) {
@@ -448,6 +556,20 @@ public class PostHog private constructor(
         }
 
         return props
+    }
+
+    /**
+     * Stamps `$screen_name = lastScreenName` into [props]. Called inside
+     * the `appendSharedProps` block in [buildProperties] BEFORE
+     * `properties?.putAll`, so a caller-supplied `$screen_name` (incl.
+     * posthog-flutter's passthrough, explicit empty for intentional
+     * "unset") overwrites this stamp on merge.
+     */
+    private fun stampCachedScreenName(props: MutableMap<String, Any>) {
+        val cached = lastScreenName
+        if (!cached.isNullOrEmpty()) {
+            props["\$screen_name"] = cached
+        }
     }
 
     public override fun capture(
@@ -490,10 +612,23 @@ public class PostHog private constructor(
                 groupIdentify = true
             }
 
+            // Attach the buffered exception steps to any $exception event (unless the caller
+            // already supplied them), so externally-built exceptions (e.g. from the Flutter/RN
+            // bridge) carry steps too, not only those captured via captureException(throwable).
+            val stepsBuffer = exceptionStepsBuffer
+            val effectiveProperties =
+                if (event == PostHogEventName.EXCEPTION.event && stepsBuffer != null) {
+                    val mutableProperties = properties?.toMutableMap() ?: mutableMapOf()
+                    stepsBuffer.attachTo(mutableProperties)
+                    mutableProperties
+                } else {
+                    properties
+                }
+
             val mergedProperties =
                 buildProperties(
                     newDistinctId,
-                    properties = properties,
+                    properties = effectiveProperties,
                     userProperties = userProperties,
                     userPropertiesSetOnce = userPropertiesSetOnce,
                     groups = groups,
@@ -537,6 +672,8 @@ public class PostHog private constructor(
                 )
                 // Notify surveys integration about the event
                 surveysHandler?.onEvent(event, mergedProperties)
+                // Notify session replay handler about the event for event triggers
+                sessionReplayHandler?.onEvent(event, mergedProperties)
             }
         } catch (e: Throwable) {
             config?.logger?.log("Capture failed: $e.")
@@ -563,11 +700,187 @@ public class PostHog private constructor(
                 exceptionProperties.putAll(it)
             }
 
+            // $exception_steps are attached in capture() for all $exception events,
+            // so externally-built exceptions (e.g. the Flutter/RN bridge) get them too.
             capture(PostHogEventName.EXCEPTION.event, properties = exceptionProperties)
         } catch (e: Throwable) {
             // we swallow all exceptions that the SDK has thrown by trying to convert
             // a captured exception to a PostHog exception event
             config?.logger?.log("captureException has thrown an exception: $e.")
+        }
+    }
+
+    override fun addExceptionStep(
+        message: String,
+        properties: Map<String, Any>?,
+    ) {
+        try {
+            if (!isEnabled()) {
+                return
+            }
+            if (config?.optOut == true) {
+                return
+            }
+            val buffer = exceptionStepsBuffer ?: return
+            // Record synchronously on the calling thread (no background dispatch): a step
+            // recorded immediately before a crash must already be buffered when the
+            // uncaught-exception handler captures it. The work is bounded and cheap.
+            buffer.add(message, Date(), properties)
+        } catch (e: Throwable) {
+            // recording must never throw into the host app, even via a host-supplied logger
+            safeLog("addExceptionStep has thrown an exception: $e.")
+        }
+    }
+
+    public override fun captureLog(
+        message: String,
+        severity: PostHogLogSeverity,
+        attributes: Map<String, Any>?,
+        traceId: String?,
+        spanId: String?,
+        traceFlags: Int?,
+    ) {
+        captureLogInternal(message, severity, attributes, traceId, spanId, traceFlags)
+    }
+
+    /**
+     * Shared implementation behind [captureLog] and the [logger] facade.
+     * Builds a record from the call-site arguments + capture-time context
+     * (distinctId, sessionId, screenName, app state, active feature flag
+     * keys), runs the `beforeSend` chain, and enqueues to the logs queue.
+     *
+     * No-ops when the SDK is disabled or opted-out.
+     */
+    private fun captureLogInternal(
+        message: String,
+        severity: PostHogLogSeverity,
+        attributes: Map<String, Any>?,
+        traceId: String?,
+        spanId: String?,
+        traceFlags: Int?,
+    ) {
+        try {
+            if (!isEnabled()) return
+            val cfg = config ?: return
+            if (cfg.optOut) return
+            if (message.isBlank()) return
+
+            // Filter + sort done inside PostHogRemoteConfig's existing lock
+            // to avoid an unnecessary value-map copy on the hot capture path.
+            val featureFlagKeys = remoteConfig?.getActiveFeatureFlagKeys() ?: emptyList()
+
+            val record =
+                PostHogLogRecord(
+                    body = message,
+                    level = severity,
+                    // Defensive deep copy — caller may reuse the map (and any
+                    // nested maps/lists inside it); the serializer reads it
+                    // later on the logs executor thread.
+                    attributes = attributes?.let { deepCopyAttributes(it) } ?: emptyMap(),
+                    traceId = traceId,
+                    spanId = spanId,
+                    traceFlags = traceFlags,
+                    distinctId = distinctId.takeIf { it.isNotBlank() },
+                    sessionId = PostHogSessionManager.getActiveSessionId()?.toString(),
+                    screenName = lastScreenName,
+                    featureFlagKeys = featureFlagKeys,
+                    appState = if (PostHogSessionManager.isAppInBackgroundSnapshot()) "background" else "foreground",
+                    timeUnixNano = PostHogLogRecord.nanosNow(cfg.dateProvider),
+                )
+
+            val sendable =
+                cfg.logs.runBeforeSend(record) { e ->
+                    safeLog("Error in beforeSend function: ${e.javaClass.simpleName}")
+                } ?: return
+
+            // Rate cap fires after `beforeSend` so records dropped by the
+            // caller don't consume the window budget — the cap reflects what
+            // the SDK would actually send, not what the caller asked us to
+            // try to send.
+            if (!acquireLogsRateCap(cfg)) return
+
+            logsQueue?.add(sendable)
+        } catch (e: Throwable) {
+            // Only the throwable class — a hook's exception message can embed
+            // user log bodies / attributes (PII).
+            safeLog("captureLog failed: ${e.javaClass.simpleName}")
+        }
+    }
+
+    /**
+     * Recursive shallow-immutable copy of arbitrarily nested log attributes.
+     * Maps, lists, sets, and arrays are duplicated so caller mutations after
+     * `captureLog` returns can't race the serializer on the logs executor.
+     * Leaves (strings, numbers, bools, opaque objects) are shared since they
+     * are either immutable or treated as immutable by the wire format.
+     */
+    @Suppress("UNCHECKED_CAST")
+    private fun deepCopyAttributes(map: Map<String, Any>): Map<String, Any> {
+        val copy = LinkedHashMap<String, Any>(map.size)
+        for ((k, v) in map) copy[k] = deepCopyValue(v)
+        return copy
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun deepCopyValue(value: Any): Any =
+        when (value) {
+            is Map<*, *> -> deepCopyAttributes(value as Map<String, Any>)
+            is List<*> -> value.map { it?.let(::deepCopyValue) }
+            is Set<*> -> value.map { it?.let(::deepCopyValue) }.toSet()
+            is Array<*> -> value.map { it?.let(::deepCopyValue) }.toTypedArray()
+            else -> value
+        }
+
+    /**
+     * Invokes `config.logger.log` swallowing any throwable — guards against a
+     * user-supplied logger that throws from inside a `catch` block (which
+     * would otherwise escape `captureLog`/`captureLogs` and surface to the
+     * caller). Guaranteed not to throw.
+     */
+    private fun safeLog(message: String) {
+        try {
+            config?.logger?.log(message)
+        } catch (e: Throwable) {
+            // The user-supplied logger threw. Fall back to the JVM's default
+            // stack-trace stream (stderr on JVM, logcat on Android) so the
+            // double-failure is at least visible if anyone goes looking.
+            // `printStackTrace` itself can throw on a broken `Throwable` impl
+            // or a closed stderr — the outer catch makes the contract above
+            // ("guaranteed not to throw") actually hold.
+            try {
+                e.printStackTrace()
+            } catch (_: Throwable) {
+                // Nowhere left to write — give up silently rather than
+                // crash the calling captureLog.
+            }
+        }
+    }
+
+    /**
+     * Tumbling-window rate cap for log capture. Returns `true` if the call
+     * is allowed, `false` if the window's budget is exhausted. Non-positive
+     * `rateCapMaxLogs` or `rateCapWindowSeconds` disable the cap.
+     */
+    private fun acquireLogsRateCap(cfg: PostHogConfig): Boolean {
+        synchronized(logsRateCapLock) {
+            // Reads of the config knobs happen under the same lock that
+            // protects the window state so a `(max, windowSeconds)` pair is
+            // either entirely pre-update or entirely post-update, never a
+            // torn mix if a caller mutates them concurrently.
+            val max = cfg.logs.rateCapMaxLogs
+            val windowSeconds = cfg.logs.rateCapWindowSeconds
+            if (max <= 0 || windowSeconds <= 0) return true
+
+            val now = cfg.dateProvider.currentTimeMillis()
+            val windowMillis = windowSeconds * 1000L
+            if (now - logsRateCapWindowStartMillis >= windowMillis) {
+                logsRateCapWindowStartMillis = now
+                logsRateCapWindowCount = 1
+                return true
+            }
+            if (logsRateCapWindowCount >= max) return false
+            logsRateCapWindowCount++
+            return true
         }
     }
 
@@ -590,6 +903,7 @@ public class PostHog private constructor(
         synchronized(optOutLock) {
             config?.optOut = true
             getPreferences().setValue(OPT_OUT, true)
+            exceptionStepsBuffer?.clear()
         }
     }
 
@@ -603,6 +917,18 @@ public class PostHog private constructor(
         return config?.optOut ?: true
     }
 
+    /**
+     * Records a screen view by capturing a `$screen` event with [screenTitle].
+     *
+     * The title is also cached and automatically attached as `$screen_name` to
+     * every subsequent event (until [reset] or [close] clears it).
+     *
+     * To override the auto-attached value on a specific event, pass `$screen_name`
+     * in that event's `properties` on the next [capture] call.
+     *
+     * @param screenTitle the screen name to record
+     * @param properties additional properties to attach to this `$screen` event
+     */
     public override fun screen(
         screenTitle: String,
         properties: Map<String, Any>?,
@@ -611,8 +937,17 @@ public class PostHog private constructor(
             return
         }
 
+        val trimmedTitle = screenTitle.trim()
+        if (trimmedTitle.isEmpty()) {
+            return
+        }
+
+        // Cache for capture-time context snapshot on log records and for the
+        // $screen_name auto-attach on subsequent events (see buildProperties).
+        this.lastScreenName = trimmedTitle
+
         val props = mutableMapOf<String, Any>()
-        props["\$screen_name"] = screenTitle
+        props["\$screen_name"] = trimmedTitle
 
         properties?.let {
             props.putAll(it)
@@ -1110,8 +1445,19 @@ public class PostHog private constructor(
         }
     }
 
+    // Invokes the feature flags callback, swallowing exceptions like runOnFeatureFlagsCallbacks.
+    private fun notifyFeatureFlagsCallback(onFeatureFlags: PostHogOnFeatureFlags?) {
+        try {
+            onFeatureFlags?.loaded()
+        } catch (e: Throwable) {
+            config?.logger?.log("Executing the feature flags callback failed: $e")
+        }
+    }
+
     public override fun reloadFeatureFlags(onFeatureFlags: PostHogOnFeatureFlags?) {
         if (!isEnabled()) {
+            // Still invoke the callback so awaiting callers aren't left hanging.
+            notifyFeatureFlagsCallback(onFeatureFlags)
             return
         }
         loadFeatureFlagsRequest(
@@ -1136,6 +1482,8 @@ public class PostHog private constructor(
 
         if (distinctId.isBlank()) {
             config?.logger?.log("Feature flags not loaded, distinctId is invalid: $distinctId")
+            // Still invoke the callback so awaiting callers aren't left hanging.
+            notifyFeatureFlagsCallback(onFeatureFlags)
             return
         }
 
@@ -1248,6 +1596,21 @@ public class PostHog private constructor(
         return flagValue
     }
 
+    public override fun getAllFeatureFlags(): List<FeatureFlagResult>? {
+        if (!isEnabled()) return null
+        val flags = remoteConfig?.getFeatureFlags()
+        val results =
+            flags?.mapNotNull { item ->
+                val featureFlagResult = remoteConfig?.getFeatureFlagResult(item.key)
+                featureFlagResult
+            }
+        return results
+    }
+
+    @Deprecated(
+        message = "Use getFeatureFlagResult() instead; note it sends the \$feature_flag_called event by default.",
+        replaceWith = ReplaceWith("getFeatureFlagResult(key)?.payload"),
+    )
     public override fun getFeatureFlagPayload(
         key: String,
         defaultValue: Any?,
@@ -1276,6 +1639,7 @@ public class PostHog private constructor(
         }
         super.flush()
         replayQueue?.flush()
+        logsQueue?.flush()
     }
 
     public override fun setPersonPropertiesForFlags(
@@ -1336,9 +1700,12 @@ public class PostHog private constructor(
             return
         }
 
-        // only remove properties, preserve BUILD and VERSION keys in order to fix over-sending
-        // of 'Application Installed' events and under-sending of 'Application Updated' events
-        val except = mutableListOf(VERSION, BUILD)
+        // Preserve BUILD and VERSION to prevent over-sending "Application Installed" events
+        // and under-sending "Application Updated" events. Preserve DEVICE_ID to maintain
+        // stable feature flag bucketing across identity changes.
+        // Preserve SESSION_REPLAY, ERROR_TRACKING, CAPTURE_PERFORMANCE, and SURVEYS (project-level config
+        // from /config, not user data) so each survives an identity change without an app restart.
+        val except = mutableListOf(VERSION, BUILD, DEVICE_ID, SESSION_REPLAY, ERROR_TRACKING, CAPTURE_PERFORMANCE, SURVEYS)
         // preserve the ANONYMOUS_ID if reuseAnonymousId is enabled (for preserving a guest user
         // account on the device)
         if (config?.reuseAnonymousId == true) {
@@ -1347,6 +1714,7 @@ public class PostHog private constructor(
         getPreferences().clear(except = except.toList())
         remoteConfig?.clear()
         featureFlagsCalled.clear()
+        lastScreenName = null
         synchronized(cachedPersonPropertiesLock) {
             cachedPersonPropertiesHash = null
         }
@@ -1393,6 +1761,32 @@ public class PostHog private constructor(
             return ""
         }
         return distinctId
+    }
+
+    override fun getAnonymousId(): String {
+        if (!isEnabled()) {
+            return ""
+        }
+        return anonymousId
+    }
+
+    override fun getDeviceId(): String {
+        if (!isEnabled()) {
+            return ""
+        }
+        synchronized(deviceIdLock) {
+            val deviceId = getPreferences().getValue(DEVICE_ID) as? String
+            if (deviceId.isNullOrBlank()) {
+                // Lazy init for upgrades: existing installs won't have a device_id yet
+                val anonId = anonymousId
+                if (anonId.isNotBlank()) {
+                    getPreferences().setValue(DEVICE_ID, anonId)
+                    return anonId
+                }
+                return ""
+            }
+            return deviceId
+        }
     }
 
     override fun startSession() {
@@ -1522,6 +1916,30 @@ public class PostHog private constructor(
 
         private val apiKeys = mutableSetOf<String>()
 
+        /**
+         * Captures application log records into PostHog's logs product
+         * (separate from product analytics events). Forwards to the shared
+         * SDK instance.
+         *
+         * ```kotlin
+         * PostHog.logger.info("checkout opened")
+         * PostHog.logger.error("payment failed", mapOf("code" to "PAY_3001"))
+         * ```
+         */
+        public override val logger: PostHogLogger
+            get() = shared.logger
+
+        public override fun captureLog(
+            message: String,
+            severity: PostHogLogSeverity,
+            attributes: Map<String, Any>?,
+            traceId: String?,
+            spanId: String?,
+            traceFlags: Int?,
+        ) {
+            shared.captureLog(message, severity, attributes, traceId, spanId, traceFlags)
+        }
+
         @PostHogVisibleForTesting
         public fun overrideSharedInstance(postHog: PostHogInterface) {
             shared = postHog
@@ -1533,9 +1951,10 @@ public class PostHog private constructor(
         }
 
         /**
-         * Set up the SDK and returns an instance that you can hold and pass it around
-         * @param T the type of the Config
-         * @property config the Config
+         * Sets up the SDK and returns an instance that you can hold and pass around.
+         *
+         * @param config SDK configuration.
+         * @return The configured PostHog client instance.
          */
         public fun <T : PostHogConfig> with(config: T): PostHogInterface {
             val instance = PostHog()
@@ -1551,13 +1970,18 @@ public class PostHog private constructor(
             featureFlagsExecutor: ExecutorService,
             cachedEventsExecutor: ExecutorService,
             reloadFeatureFlags: Boolean,
+            logsExecutor: ExecutorService =
+                Executors.newSingleThreadScheduledExecutor(
+                    PostHogThreadFactory("PostHogLogsQueueThread"),
+                ),
         ): PostHogInterface {
             val instance =
                 PostHog(
-                    queueExecutor,
-                    replayExecutor,
-                    featureFlagsExecutor,
-                    cachedEventsExecutor,
+                    queueExecutor = queueExecutor,
+                    replayExecutor = replayExecutor,
+                    logsExecutor = logsExecutor,
+                    remoteConfigExecutor = featureFlagsExecutor,
+                    cachedEventsExecutor = cachedEventsExecutor,
                     reloadFeatureFlags = reloadFeatureFlags,
                 )
             instance.setup(config)
@@ -1599,6 +2023,13 @@ public class PostHog private constructor(
             shared.captureException(throwable, properties)
         }
 
+        public override fun addExceptionStep(
+            message: String,
+            properties: Map<String, Any>?,
+        ) {
+            shared.addExceptionStep(message, properties)
+        }
+
         public override fun identify(
             distinctId: String,
             userProperties: Map<String, Any>?,
@@ -1632,6 +2063,15 @@ public class PostHog private constructor(
             sendFeatureFlagEvent: Boolean?,
         ): Any? = shared.getFeatureFlag(key, defaultValue = defaultValue, sendFeatureFlagEvent)
 
+        override fun getAllFeatureFlags(): List<FeatureFlagResult>? {
+            return shared.getAllFeatureFlags()
+        }
+
+        @Deprecated(
+            message = "Use getFeatureFlagResult() instead; note it sends the \$feature_flag_called event by default.",
+            replaceWith = ReplaceWith("getFeatureFlagResult(key)?.payload"),
+        )
+        @Suppress("DEPRECATION")
         public override fun getFeatureFlagPayload(
             key: String,
             defaultValue: Any?,
@@ -1767,6 +2207,10 @@ public class PostHog private constructor(
         }
 
         override fun distinctId(): String = shared.distinctId()
+
+        override fun getAnonymousId(): String = shared.getAnonymousId()
+
+        override fun getDeviceId(): String = shared.getDeviceId()
 
         override fun debug(enable: Boolean) {
             shared.debug(enable)

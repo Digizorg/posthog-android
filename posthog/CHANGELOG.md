@@ -1,5 +1,196 @@
 ## Next
 
+## 6.21.2
+
+### Patch Changes
+
+- 125f724: Clear the feature flag called cache when closing the SDK.
+
+## 6.21.1
+
+### Patch Changes
+
+- 8f75572: Session replay: skip native event-trigger gating when running under React Native (`sdkName == "posthog-react-native"`). `PostHogRemoteConfig.getEventTriggers()` returns null for RN, so the native recorder no longer self-gates and `startSessionReplay` records as instructed. React Native evaluates `sessionRecording.eventTriggers` in its JS layer and drives recording explicitly; the native gate could never be satisfied because JS-captured events never reach the native capture pipeline, so event-triggered replay never recorded on RN. The linked-flag and sampling gates are unchanged, and non-RN behavior is unaffected.
+
+## 6.21.0
+
+### Minor Changes
+
+- d64ad52: Add `addExceptionStep(message, properties?)` and the `errorTrackingConfig.exceptionSteps` config (enabled by default, 32 KiB byte budget). Recorded steps are buffered in a rolling, byte-bounded FIFO and attached to every captured `$exception` event as `$exception_steps`.
+
+## 6.20.0
+
+### Minor Changes
+
+- e227aa5: Expose `getAnonymousId()` on `PostHogInterface`. Returns the anonymous ID generated before any `identify()` call — unlike `distinctId()`, this does not change after identification.
+
+## 6.19.1
+
+### Patch Changes
+
+- 52c9094: Deprecate `getFeatureFlagPayload` in favor of `getFeatureFlagResult`, which returns the flag value and payload from a single evaluation. `getFeatureFlagPayload` continues to work.
+
+## 6.19.0
+
+### Minor Changes
+
+- 8632f77: Surveys: expose `surveyPopupDelaySeconds` on the public `PostHogDisplaySurveyAppearance` and map it
+  from the internal `SurveyAppearance`, so survey UIs can honor the configured popup delay before
+  presenting a survey.
+
+## 6.18.0
+
+### Minor Changes
+
+- 3203bda: Add a public `captureLog()` API for capturing logs with optional W3C trace correlation (`traceId`/`spanId`/`traceFlags`), matching iOS, web, and React Native. The `logger` facade is unchanged.
+
+## 6.17.8
+
+### Patch Changes
+
+- 1965fd1: Update core local-evaluation serialization so cached flag definitions round-trip using endpoint-compatible JSON for nested property values, property operators, and property types.
+
+## 6.17.7
+
+### Patch Changes
+
+- 0bde688: Keep surveys loaded after an in-session `identify()`/`reset()` instead of clearing them until the next app restart.
+
+## 6.17.6
+
+### Patch Changes
+
+- 27f8f5f: Refactor duplicated internal code paths without changing SDK behavior.
+
+## 6.17.5
+
+### Patch Changes
+
+- 43dd856: Add QueueFile regression coverage for endian-safe header and element persistence.
+
+## 6.17.4
+
+### Patch Changes
+
+- ea18b31: `reloadFeatureFlags` now always invokes its completion callback, including when the SDK is disabled/opted-out or the distinct ID is blank. Previously these early-returns skipped the callback, which could leave callers that await it (e.g. the Flutter SDK's `reloadFeatureFlags`) hanging indefinitely.
+- 1a60d00: Keep session replay, error tracking, and network performance capture active after an in-session `identify()`/`reset()` instead of disabling them until the next app restart.
+
+## 6.17.3
+
+### Patch Changes
+
+- 875e972: Improve public API KDoc coverage.
+
+## 6.17.2
+
+### Patch Changes
+
+- 8fa1bfc: Retry event uploads on HTTP 408 (Request Timeout). 408 is transient and retryable, and the logs endpoint already retries it; this aligns the events endpoint with the SDK compliance contract.
+
+## 6.17.1
+
+### Patch Changes
+
+- 3deea3d: Include group context in the `$feature_flag_called` LRU dedupe key so group-scoped flags fire a separate event for each group a user is evaluated under, instead of being dedup-ed against the first group context the same `(distinctId, flagKey, value)` was seen under. The groups are canonicalized order-independently so two equal maps built in different insertion orders still dedupe to one event.
+
+## 6.17.0
+
+### Minor Changes
+
+- 8d11398: Add public Logs API: `PostHog.logger.trace/debug/info/warn/error/fatal(message, attrs?)` plus a `PostHogLogsConfig` for serviceName, environment, resourceAttributes, rate cap, and `addBeforeSend` redaction hooks. Logs ship via OTLP/JSON to `/i/v1/logs` and pick up auto-attached attributes (`app.state`, distinctId, sessionId, screen name, feature flags). Matches the equivalent surfaces on posthog-ios and posthog-react-native.
+- 8d11398: Auto-attach `$screen_name` to every captured event after `PostHog.screen()` has been called (manually or via Activity-lifecycle auto-capture). Cached value is cleared by `reset()` and `close()`.
+
+  **To opt out of `$screen_name` stamping entirely**, set `PostHogAndroidConfig.captureScreenViews = false` **and** stop calling `PostHog.screen()` manually. Disabling `captureScreenViews` alone is not sufficient — a single manual `PostHog.screen("Home")` call will re-enable stamping.
+
+## 6.16.0
+
+### Minor Changes
+
+- 09f86a6: Add public Logs API: `PostHog.logger.trace/debug/info/warn/error/fatal(message, attrs?)` plus a `PostHogLogsConfig` for serviceName, environment, resourceAttributes, rate cap, and `addBeforeSend` redaction hooks. Logs ship via OTLP/JSON to `/i/v1/logs` and pick up auto-attached attributes (`app.state`, distinctId, sessionId, screen name, feature flags). Matches the equivalent surfaces on posthog-ios and posthog-react-native.
+
+## 6.15.0
+
+### Minor Changes
+
+- 2282895: Add survey translations support. Surveys can carry per-language overrides for user-visible strings via a `translations` map keyed by language code. At display time the SDK resolves a language (init override → person property `"language"` → device locale), applies any matching translation onto the display model, and stamps the matched key as `$survey_language` on every survey event when a translation actually took effect.
+
+  Configure via `PostHogSurveysConfig.overrideDisplayLanguage`. Matching is case-insensitive with a base-language fallback (e.g. `"pt-BR"` falls back to `"pt"`).
+
+## 6.14.2
+
+### Patch Changes
+
+- 27650da: Refactor `PostHogQueue` to be generic on `Record` and introduce `EndpointSpec`
+  for per-endpoint codec, send, retry policy, and runtime knobs. No behavior
+  change for events or session replay; sets up future log-record support without
+  duplicating queue plumbing.
+
+## 6.14.1
+
+### Patch Changes
+
+- e2f9884: Disable SDK setup when the API key is empty or whitespace after trimming.
+
+## 6.14.0
+
+### Minor Changes
+
+- 006f5d0: feat: support session replay minimum recording duration
+
+## 6.13.3
+
+### Patch Changes
+
+- 3a2a1ec: Stop mutating user-supplied `PostHogConfig.maxBatchSize` and `PostHogConfig.flushAt` when the events queue adapts to HTTP 413 responses. The adaptive cap is now kept in private queue state, halved from the actual batch size that triggered the 413, and `flushAt` is clamped to the cap so a partial-batch 413 can't leave the queue buffering more events than a single batch can drain.
+
+## 6.13.2
+
+### Patch Changes
+
+- 590d694: Enforce 24-hour maximum session duration and 30-minute inactivity rotation with automatic session rotation, mirroring iOS. Note: `PostHogSessionManager.isAppInBackground` now defaults to `true` until the first lifecycle `onStart` flips it; downstream wrappers (Flutter, RN) that exercise the manager directly in tests may need to call `setAppInBackground(false)` to simulate a foregrounded process.
+
+## 6.13.1
+
+### Patch Changes
+
+- ed31712: Include survey responses on Android dismissal events, including question id based response keys and partial completion state. Null rating responses are ignored instead of being serialized as "null".
+
+## 6.13.0
+
+### Minor Changes
+
+- fbb5a25: Add tracing header support for Android OkHttp requests.
+
+## 6.12.1
+
+### Patch Changes
+
+- 840025b: Trim surrounding whitespace from API keys, personal API keys, and host config before using them.
+
+## 6.12.0
+
+### Minor Changes
+
+- 3a0b654: add getAllFeatureFlags support
+
+## 6.11.0
+
+### Minor Changes
+
+- 6fbdcd5: feat: add device bucketing support for stable feature flag assignment across identity changes
+
+## 6.10.1
+
+### Patch Changes
+
+- a22edb0: fix: failing posthog-core release
+
+## 6.10.0
+
+### Minor Changes
+
+- f3edb25: feat: add support for session replay event triggers
+
 ## 6.9.0
 
 ### Minor Changes
@@ -514,7 +705,7 @@ config.proxy = Proxy(Proxy.Type.HTTP, InetSocketAddress("proxy.example.com",8080
 
 - chore: Add mutations support to Session Recording ([#72](https://github.com/PostHog/posthog-android/pull/72))
 - chore: Session Recording as Experimental preview
-  - Check out the [USAGE](https://github.com/PostHog/posthog-android/blob/main/USAGE.md#android-session-recording) guide.
+  - Check out the [docs](https://posthog.com/docs/session-replay/mobile) guide.
 
 ## 3.0.1 - 2024-01-03
 
@@ -528,13 +719,13 @@ config.proxy = Proxy(Proxy.Type.HTTP, InetSocketAddress("proxy.example.com",8080
 
 - Android Session Recording - Alpha preview ([#69](https://github.com/PostHog/posthog-android/pull/69))
 
-Check out the [USAGE](https://github.com/PostHog/posthog-android/blob/main/USAGE.md#android-session-recording) guide.
+Check out the [docs](https://posthog.com/docs/session-replay/mobile) guide.
 
 ## 3.0.0 - 2023-12-06
 
 Check out the updated [docs](https://posthog.com/docs/libraries/android).
 
-Check out the [USAGE](https://github.com/PostHog/posthog-android/blob/main/USAGE.md) guide.
+Check out the [docs](https://posthog.com/docs/libraries/android) guide.
 
 ### Changes
 

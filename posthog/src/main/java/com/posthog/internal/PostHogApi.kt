@@ -7,6 +7,8 @@ import com.posthog.PostHogConfig.Companion.DEFAULT_US_ASSETS_HOST
 import com.posthog.PostHogConfig.Companion.DEFAULT_US_HOST
 import com.posthog.PostHogEvent
 import com.posthog.PostHogInternal
+import com.posthog.internal.logs.PostHogLogsOTLP
+import com.posthog.logs.PostHogLogRecord
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -63,15 +65,7 @@ public class PostHogApi(
                 config.serializer.serialize(batch, it.bufferedWriter())
             }
 
-        logRequestHeaders(request)
-
-        client.newCall(request).execute().use {
-            val response = logResponse(it)
-
-            if (!response.isSuccessful) {
-                throw PostHogApiError(response.code, response.message, response.body, parseRetryAfter(response))
-            }
-        }
+        executeNoBody(request)
     }
 
     @Throws(PostHogApiError::class, IOException::class)
@@ -89,6 +83,42 @@ public class PostHogApi(
                 config.serializer.serialize(events, it.bufferedWriter())
             }
 
+        executeNoBody(request)
+    }
+
+    /**
+     * Builds an OTLP/JSON payload for the supplied [records] and posts it to
+     * `/i/v1/logs?token=<apiKey>`. Throws [PostHogApiError] on a non-success
+     * status and [IOException] on a transport failure.
+     *
+     * `resourceAttributes` (e.g. `service.name`, `service.version`) is merged
+     * with SDK-managed `telemetry.sdk.*` keys before serialization.
+     */
+    @Throws(PostHogApiError::class, IOException::class)
+    internal fun sendLogs(
+        records: List<PostHogLogRecord>,
+        resourceAttributes: Map<String, Any>,
+    ) {
+        val payload =
+            PostHogLogsOTLP.buildPayload(
+                records = records,
+                resourceAttributes = resourceAttributes,
+                sdkName = config.sdkName,
+                sdkVersion = config.sdkVersion,
+            )
+
+        val url = "$theHost/i/v1/logs?token=${config.apiKey}"
+        val request =
+            makeRequest(url) {
+                logRequest(payload, url)
+                config.serializer.serialize(payload, it.bufferedWriter())
+            }
+
+        executeNoBody(request)
+    }
+
+    @Throws(PostHogApiError::class, IOException::class)
+    private fun executeNoBody(request: Request) {
         logRequestHeaders(request)
 
         client.newCall(request).execute().use {
@@ -134,19 +164,25 @@ public class PostHogApi(
     public fun flags(
         distinctId: String,
         anonymousId: String? = null,
+        deviceId: String? = null,
         groups: Map<String, String>? = null,
         personProperties: Map<String, Any?>? = null,
         groupProperties: Map<String, Map<String, Any?>>? = null,
+        flagKeys: List<String>? = null,
+        disableGeoip: Boolean = false,
     ): PostHogFlagsResponse? {
         val flagsRequest =
             PostHogFlagsRequest(
                 config.apiKey,
                 distinctId,
                 anonymousId = anonymousId,
+                deviceId = deviceId,
                 groups,
                 personProperties,
                 groupProperties,
                 config.evaluationContexts,
+                flagKeys = flagKeys,
+                disableGeoip = disableGeoip,
             )
 
         val url = "$theHost/flags/?v=2"

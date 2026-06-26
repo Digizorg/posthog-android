@@ -3,10 +3,13 @@ package com.posthog
 import com.posthog.internal.PostHogBatchEvent
 import com.posthog.internal.PostHogContext
 import com.posthog.internal.PostHogMemoryPreferences
+import com.posthog.internal.PostHogPreferences.Companion.CAPTURE_PERFORMANCE
+import com.posthog.internal.PostHogPreferences.Companion.ERROR_TRACKING
 import com.posthog.internal.PostHogPreferences.Companion.GROUPS
 import com.posthog.internal.PostHogPreferences.Companion.GROUP_PROPERTIES_FOR_FLAGS
 import com.posthog.internal.PostHogPreferences.Companion.PERSON_PROPERTIES_FOR_FLAGS
 import com.posthog.internal.PostHogPreferences.Companion.SESSION_REPLAY
+import com.posthog.internal.PostHogPreferences.Companion.SURVEYS
 import com.posthog.internal.PostHogPrintLogger
 import com.posthog.internal.PostHogSendCachedEventsIntegration
 import com.posthog.internal.PostHogSerializer
@@ -24,6 +27,7 @@ import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -44,6 +48,9 @@ internal class PostHogTest {
     private val responseFlagsApi = file.readText()
 
     @Suppress("DEPRECATION")
+    private fun getThreadId(thread: Thread): Long = thread.id
+
+    @Suppress("DEPRECATION")
     fun getSut(
         host: String,
         flushAt: Int = 1,
@@ -55,12 +62,15 @@ internal class PostHogTest {
         reuseAnonymousId: Boolean = false,
         integration: PostHogIntegration? = null,
         remoteConfig: Boolean = false,
+        surveys: Boolean = false,
         cachePreferences: PostHogMemoryPreferences = PostHogMemoryPreferences(),
         propertiesSanitizer: PostHogPropertiesSanitizer? = null,
         beforeSend: PostHogBeforeSend? = null,
         evaluationContexts: List<String>? = null,
         context: PostHogContext? = null,
         personProfiles: PersonProfiles = PersonProfiles.IDENTIFIED_ONLY,
+        exceptionStepsEnabled: Boolean = true,
+        exceptionStepsMaxBytes: Int = 32768,
     ): PostHogInterface {
         config =
             PostHogConfig(API_KEY, host).apply {
@@ -79,10 +89,13 @@ internal class PostHogTest {
                 this.propertiesSanitizer = propertiesSanitizer
                 this.evaluationContexts = evaluationContexts
                 this.remoteConfig = remoteConfig
+                this.surveys = surveys
                 if (beforeSend != null) {
                     addBeforeSend(beforeSend)
                 }
                 this.errorTrackingConfig.inAppIncludes.add("com.posthog")
+                this.errorTrackingConfig.exceptionSteps.enabled = exceptionStepsEnabled
+                this.errorTrackingConfig.exceptionSteps.maxBytes = exceptionStepsMaxBytes
                 this.context = context
                 this.personProfiles = personProfiles
             }
@@ -121,6 +134,27 @@ internal class PostHogTest {
         val sut = getSut(url.toString(), optOut = true)
 
         assertTrue(sut.isOptOut())
+
+        sut.close()
+    }
+
+    @Test
+    fun `setup no-ops for empty trimmed api key`() {
+        val config = PostHogConfig(" \n\t ", "https://api.posthog.com")
+        val logger = TestLogger()
+        config.logger = logger
+        val sut =
+            PostHog.withInternal(
+                config,
+                queueExecutor,
+                replayQueueExecutor,
+                remoteConfigExecutor,
+                cachedEventsExecutor,
+                reloadFeatureFlags = true,
+            )
+
+        assertTrue(sut.isOptOut())
+        assertTrue(logger.messages.any { it.contains("PostHog SDK is disabled because the API key is required") })
 
         sut.close()
     }
@@ -499,6 +533,7 @@ internal class PostHogTest {
     }
 
     @Test
+    @Suppress("DEPRECATION")
     fun `getFeatureFlagPayload returns the value after reloaded`() {
         val http =
             mockHttp(
@@ -515,6 +550,39 @@ internal class PostHogTest {
         remoteConfigExecutor.shutdownAndAwaitTermination()
 
         assertTrue(sut.getFeatureFlagPayload("4535-funnel-bar-viz") as Boolean)
+
+        sut.close()
+    }
+
+    @Test
+    fun `getAllFeatureFlags returns list of feature flags if enabled`() {
+        val file = File("src/test/resources/json/basic-flags-with-non-active-flags.json")
+        val responseFlagsApi = file.readText()
+        val http =
+            mockHttp(
+                response =
+                    MockResponse()
+                        .setBody(responseFlagsApi),
+            )
+        val url = http.url("/")
+
+        val sut = getSut(url.toString(), preloadFeatureFlags = false)
+
+        sut.reloadFeatureFlags()
+
+        remoteConfigExecutor.shutdownAndAwaitTermination()
+
+        val flags = sut.getAllFeatureFlags()
+
+        val result = flags?.first()
+
+        assertNotNull(result)
+        assertIs<FeatureFlagResult>(result)
+        assertEquals("4535-funnel-bar-viz", result.key)
+        assertTrue(result.enabled)
+        assertNull(result.variant)
+        assertTrue(result.payload as Boolean)
+        assertTrue(result.value as Boolean)
 
         sut.close()
     }
@@ -797,6 +865,82 @@ internal class PostHogTest {
         assertEquals(groups, theEvent.properties!!["\$groups"])
 
         sut.close()
+    }
+
+    @Test
+    fun `capture preserves caller-provided session_id over the session manager`() {
+        val http = mockHttp()
+        val url = http.url("/")
+
+        val sut = getSut(url.toString(), preloadFeatureFlags = false)
+        sut.startSession()
+        val managerSessionId = PostHogSessionManager.getActiveSessionId()
+        assertNotNull(managerSessionId)
+
+        val callerSessionId = TimeBasedEpochGenerator.generate().toString()
+        assertNotEquals(managerSessionId.toString(), callerSessionId)
+
+        sut.capture(
+            EVENT,
+            DISTINCT_ID,
+            properties = mapOf("\$session_id" to callerSessionId),
+        )
+
+        queueExecutor.shutdownAndAwaitTermination()
+
+        val request = http.takeRequest()
+        val content = request.body.unGzip()
+        val batch = serializer.deserialize<PostHogBatchEvent>(content.reader())
+        val theEvent = batch.batch.first()
+
+        assertEquals(callerSessionId, theEvent.properties!!["\$session_id"])
+
+        sut.close()
+    }
+
+    @Test
+    fun `getter rotation fires session replay handler onSessionIdChanged`() {
+        val http = mockHttp()
+        val url = http.url("/")
+        val integration = PostHogSessionReplayHandlerFake(true)
+        val sut = getSut(url.toString(), preloadFeatureFlags = false, integration = integration)
+
+        // Force the manager into an expired state: stamp sessionStartedAt with an old
+        // timestamp via setSessionId, then bump the clock back to "now" so the getter's
+        // expiry check trips. Foreground so the getter rotates instead of clearing.
+        PostHogSessionManager.setAppInBackground(false)
+        val twentyFiveHoursMs = 25L * 60 * 60 * 1000
+        val realNow = System.currentTimeMillis()
+        val fakeDate = TestDateProvider(realNow - twentyFiveHoursMs)
+        PostHogSessionManager.setDateProvider(fakeDate)
+        PostHogSessionManager.setSessionId(java.util.UUID.randomUUID())
+        fakeDate.nowMs = realNow
+
+        // setSessionId may have triggered onSessionIdChanged via other paths during setup;
+        // reset before the assertion so we measure the rotation specifically.
+        integration.onSessionIdChangedCalled = false
+
+        sut.getSessionId() // triggers getter rotation since we're past 24h
+
+        assertTrue(integration.onSessionIdChangedCalled)
+
+        PostHogSessionManager.setDateProvider(com.posthog.internal.PostHogDeviceDateProvider())
+        sut.close()
+    }
+
+    private class TestDateProvider(var nowMs: Long) : com.posthog.internal.PostHogDateProvider {
+        override fun currentDate(): java.util.Date = java.util.Date(nowMs)
+
+        override fun addSecondsToCurrentDate(seconds: Int): java.util.Date {
+            val cal = java.util.Calendar.getInstance()
+            cal.timeInMillis = nowMs
+            cal.add(java.util.Calendar.SECOND, seconds)
+            return cal.time
+        }
+
+        override fun currentTimeMillis(): Long = nowMs
+
+        override fun nanoTime(): Long = System.nanoTime()
     }
 
     @Test
@@ -2102,12 +2246,18 @@ internal class PostHogTest {
         )
         val url = http.url("/")
 
+        // Recording config comes from /config (cached); the /flags reload re-arms from the cache and
+        // evaluates the linked flag, which is what fires $feature_flag_called.
+        val cachePreferences = PostHogMemoryPreferences()
+        cachePreferences.setValue(SESSION_REPLAY, mapOf("endpoint" to "/b/", "linkedFlag" to "session-replay-flag"))
+
         val integration = PostHogSessionReplayHandlerFake(true)
         val sut =
             getSut(
                 url.toString(),
                 preloadFeatureFlags = false,
                 integration = integration,
+                cachePreferences = cachePreferences,
             )
 
         sut.reloadFeatureFlags()
@@ -2148,6 +2298,11 @@ internal class PostHogTest {
         )
         val url = http.url("/")
 
+        // Recording config comes from /config (cached); the /flags reload re-arms from the cache and
+        // evaluates the linked flag. With sendFeatureFlagEvent = false, no $feature_flag_called fires.
+        val cachePreferences = PostHogMemoryPreferences()
+        cachePreferences.setValue(SESSION_REPLAY, mapOf("endpoint" to "/b/", "linkedFlag" to "session-replay-flag"))
+
         val integration = PostHogSessionReplayHandlerFake(true)
         val sut =
             getSut(
@@ -2155,6 +2310,7 @@ internal class PostHogTest {
                 preloadFeatureFlags = false,
                 integration = integration,
                 sendFeatureFlagEvent = false,
+                cachePreferences = cachePreferences,
             )
 
         sut.reloadFeatureFlags()
@@ -2213,6 +2369,7 @@ internal class PostHogTest {
     }
 
     @Test
+    @Suppress("DEPRECATION")
     fun `captureException captures exception with correct properties`() {
         val http = mockHttp()
         val url = http.url("/")
@@ -2259,7 +2416,7 @@ internal class PostHogTest {
         assertEquals("Exception", causeExceptionData["type"])
         assertEquals("I am the cause", causeExceptionData["value"])
 
-        val threadId = Thread.currentThread().id
+        val threadId = getThreadId(Thread.currentThread())
         // Verify both exceptions have the required structure
         // Check main exception structure
         assertEquals("RuntimeException", mainException["type"])
@@ -2315,6 +2472,7 @@ internal class PostHogTest {
     }
 
     @Test
+    @Suppress("DEPRECATION")
     fun `captureException unwraps and captures exception with correct properties`() {
         val http = mockHttp()
         val url = http.url("/")
@@ -2357,7 +2515,7 @@ internal class PostHogTest {
         assertEquals("RuntimeException", mainException["type"])
         assertEquals("Test exception message", mainException["value"])
 
-        assertEquals(thread.id, (mainException["thread_id"] as Number).toLong())
+        assertEquals(getThreadId(thread), (mainException["thread_id"] as Number).toLong())
 
         // Verify mechanism structure for main exception
         val mechanism = mainException["mechanism"] as Map<*, *>
@@ -3013,6 +3171,408 @@ internal class PostHogTest {
         assertEquals("\$set", batch.batch[0].event)
         assertEquals(userPropertiesToSet, batch.batch[0].properties!!["\$set"])
         assertEquals(userPropertiesToSetOnce, batch.batch[0].properties!!["\$set_once"])
+
+        sut.close()
+    }
+
+    @Test
+    fun `getDeviceId returns a non-empty value after setup`() {
+        val http = mockHttp()
+        val url = http.url("/")
+
+        val sut = getSut(url.toString(), preloadFeatureFlags = false, reloadFeatureFlags = false)
+
+        val deviceId = sut.getDeviceId()
+        assertTrue(deviceId.isNotBlank())
+
+        sut.close()
+    }
+
+    @Test
+    fun `getDeviceId equals anonymousId on first init`() {
+        val http = mockHttp()
+        val url = http.url("/")
+
+        val cachePreferences = PostHogMemoryPreferences()
+        val sut = getSut(url.toString(), preloadFeatureFlags = false, reloadFeatureFlags = false, cachePreferences = cachePreferences)
+
+        val deviceId = sut.getDeviceId()
+        val distinctId = sut.distinctId()
+
+        // On first init with no identify, distinctId equals the anonymous ID
+        assertEquals(distinctId, deviceId)
+
+        sut.close()
+    }
+
+    @Test
+    fun `getDeviceId persists across SDK restarts`() {
+        val http = mockHttp()
+        val url = http.url("/")
+
+        val cachePreferences = PostHogMemoryPreferences()
+        val sut = getSut(url.toString(), preloadFeatureFlags = false, reloadFeatureFlags = false, cachePreferences = cachePreferences)
+
+        val originalDeviceId = sut.getDeviceId()
+        sut.close()
+
+        // Re-init with same preferences
+        val sut2 = getSut(url.toString(), preloadFeatureFlags = false, reloadFeatureFlags = false, cachePreferences = cachePreferences)
+
+        assertEquals(originalDeviceId, sut2.getDeviceId())
+
+        sut2.close()
+    }
+
+    @Test
+    fun `getDeviceId is preserved across identify`() {
+        val http = mockHttp()
+        val url = http.url("/")
+
+        val sut = getSut(url.toString(), preloadFeatureFlags = false, reloadFeatureFlags = false, personProfiles = PersonProfiles.ALWAYS)
+
+        val originalDeviceId = sut.getDeviceId()
+        sut.identify("user-123")
+
+        assertEquals(originalDeviceId, sut.getDeviceId())
+        assertEquals("user-123", sut.distinctId())
+
+        sut.close()
+    }
+
+    @Test
+    fun `getDeviceId is preserved across reset`() {
+        val http = mockHttp()
+        val url = http.url("/")
+
+        val sut = getSut(url.toString(), preloadFeatureFlags = false, reloadFeatureFlags = false, personProfiles = PersonProfiles.ALWAYS)
+
+        val originalDeviceId = sut.getDeviceId()
+        sut.identify("user-123")
+        sut.reset()
+
+        assertEquals(originalDeviceId, sut.getDeviceId())
+        // distinct_id should have changed after reset
+        assertNotEquals("user-123", sut.distinctId())
+
+        sut.close()
+    }
+
+    @Test
+    fun `project-level remote config is preserved across reset`() {
+        val http = mockHttp()
+        val url = http.url("/")
+
+        val cachePreferences = PostHogMemoryPreferences()
+        cachePreferences.setValue(SESSION_REPLAY, mapOf("endpoint" to "/b/"))
+        cachePreferences.setValue(ERROR_TRACKING, mapOf("autocaptureExceptions" to true))
+        cachePreferences.setValue(CAPTURE_PERFORMANCE, mapOf("network_timing" to true))
+        cachePreferences.setValue(
+            SURVEYS,
+            listOf(mapOf("id" to "s1", "name" to "Test Survey", "type" to "popover", "questions" to emptyList<Any>())),
+        )
+
+        val sut =
+            getSut(
+                url.toString(),
+                preloadFeatureFlags = false,
+                reloadFeatureFlags = false,
+                surveys = true,
+                cachePreferences = cachePreferences,
+            )
+
+        sut.identify("user-123")
+        sut.reset()
+
+        // reset() keeps the project-level config so each can re-arm on the next /flags reload.
+        assertNotNull(cachePreferences.getValue(SESSION_REPLAY))
+        assertNotNull(cachePreferences.getValue(ERROR_TRACKING))
+        assertNotNull(cachePreferences.getValue(CAPTURE_PERFORMANCE))
+        assertNotNull(cachePreferences.getValue(SURVEYS))
+
+        sut.close()
+    }
+
+    @Test
+    fun `device_id is sent in flags request`() {
+        val file = File("src/test/resources/json/flags-v1/basic-flags-no-errors.json")
+        val responseFlagsApi = file.readText()
+
+        val http =
+            mockHttp(
+                response =
+                    MockResponse()
+                        .setBody(responseFlagsApi),
+            )
+        val url = http.url("/")
+
+        val sut = getSut(url.toString(), preloadFeatureFlags = false)
+
+        val deviceId = sut.getDeviceId()
+        assertTrue(deviceId.isNotBlank())
+
+        sut.reloadFeatureFlags()
+        remoteConfigExecutor.shutdownAndAwaitTermination()
+
+        val request = http.takeRequest()
+        val body = request.body.unGzip()
+        val flagsRequest = serializer.deserialize<Map<String, Any>>(body.reader())
+
+        assertEquals(deviceId, flagsRequest["\$device_id"])
+
+        sut.close()
+    }
+
+    @Test
+    fun `device_id remains the same in flags request after identify`() {
+        val file = File("src/test/resources/json/flags-v1/basic-flags-no-errors.json")
+        val responseFlagsApi = file.readText()
+
+        val http =
+            mockHttp(
+                total = 3,
+                response =
+                    MockResponse()
+                        .setBody(responseFlagsApi),
+            )
+        val url = http.url("/")
+
+        val sut = getSut(url.toString(), preloadFeatureFlags = false, reloadFeatureFlags = false, personProfiles = PersonProfiles.ALWAYS)
+
+        val deviceId = sut.getDeviceId()
+        sut.identify("user-123")
+
+        // Drain the $identify batch event that gets flushed automatically
+        queueExecutor.awaitExecution()
+        http.takeRequest()
+
+        sut.reloadFeatureFlags()
+        remoteConfigExecutor.shutdownAndAwaitTermination()
+
+        val request = http.takeRequest()
+        val body = request.body.unGzip()
+        val flagsRequest = serializer.deserialize<Map<String, Any>>(body.reader())
+
+        assertEquals(deviceId, flagsRequest["\$device_id"])
+
+        sut.close()
+    }
+
+    @Test
+    fun `getDeviceId lazy-inits for upgrades from older SDK versions`() {
+        val http = mockHttp()
+        val url = http.url("/")
+
+        // Simulate an upgrade: preferences have an anonymous ID but no device_id
+        val cachePreferences = PostHogMemoryPreferences()
+        val sut = getSut(url.toString(), preloadFeatureFlags = false, reloadFeatureFlags = false, cachePreferences = cachePreferences)
+
+        // The device_id should have been initialized during setup
+        val deviceId = sut.getDeviceId()
+        assertTrue(deviceId.isNotBlank())
+
+        // Clear the device_id to simulate an upgrade scenario where initDeviceId wasn't called
+        cachePreferences.remove("deviceId")
+
+        // getDeviceId should lazy-init from the anonymous ID
+        val lazyDeviceId = sut.getDeviceId()
+        assertTrue(lazyDeviceId.isNotBlank())
+        assertEquals(deviceId, lazyDeviceId)
+
+        sut.close()
+    }
+
+    private fun exceptionStepMessages(event: com.posthog.PostHogEvent): List<Any?> {
+        @Suppress("UNCHECKED_CAST")
+        val steps = event.properties!!["\$exception_steps"] as? List<Map<String, Any>> ?: return emptyList()
+        return steps.map { it["\$message"] }
+    }
+
+    @Test
+    fun `addExceptionStep attaches ordered steps to the exception event`() {
+        val http = mockHttp()
+        val url = http.url("/")
+
+        val sut = getSut(url.toString(), preloadFeatureFlags = false, reloadFeatureFlags = false)
+
+        sut.addExceptionStep("A", mapOf("screen" to "cart"))
+        sut.addExceptionStep("B")
+        sut.addExceptionStep("C")
+
+        sut.captureException(RuntimeException("boom"))
+
+        queueExecutor.shutdownAndAwaitTermination()
+
+        val request = http.takeRequest()
+        val content = request.body.unGzip()
+        val batch = serializer.deserialize<PostHogBatchEvent>(content.reader())
+
+        val theEvent = batch.batch.first()
+        assertEquals("\$exception", theEvent.event)
+        assertEquals(listOf("A", "B", "C"), exceptionStepMessages(theEvent))
+
+        sut.close()
+    }
+
+    @Test
+    fun `addExceptionStep does not overwrite caller-provided exception steps`() {
+        val http = mockHttp()
+        val url = http.url("/")
+
+        val sut = getSut(url.toString(), preloadFeatureFlags = false, reloadFeatureFlags = false)
+
+        sut.addExceptionStep("buffered")
+
+        sut.captureException(
+            RuntimeException("boom"),
+            properties = mapOf("\$exception_steps" to listOf(mapOf("\$message" to "caller"))),
+        )
+
+        queueExecutor.shutdownAndAwaitTermination()
+
+        val request = http.takeRequest()
+        val content = request.body.unGzip()
+        val batch = serializer.deserialize<PostHogBatchEvent>(content.reader())
+
+        assertEquals(listOf("caller"), exceptionStepMessages(batch.batch.first()))
+
+        sut.close()
+    }
+
+    @Test
+    fun `exception steps persist across captures and identity changes`() {
+        val http = mockHttp()
+        val url = http.url("/")
+
+        val sut = getSut(url.toString(), preloadFeatureFlags = false, reloadFeatureFlags = false, flushAt = 100)
+
+        sut.addExceptionStep("A")
+        sut.addExceptionStep("B")
+        sut.captureException(RuntimeException("first"))
+
+        sut.reset()
+
+        sut.addExceptionStep("C")
+        sut.captureException(RuntimeException("second"))
+
+        // flushAt is high so neither capture triggers a flush on its own; flush explicitly
+        // so both events land in a single batch
+        sut.flush()
+        queueExecutor.shutdownAndAwaitTermination()
+
+        val request = http.takeRequest()
+        val content = request.body.unGzip()
+        val batch = serializer.deserialize<PostHogBatchEvent>(content.reader())
+
+        val exceptions = batch.batch.filter { it.event == "\$exception" }
+        assertEquals(listOf("A", "B"), exceptionStepMessages(exceptions[0]))
+        assertEquals(listOf("A", "B", "C"), exceptionStepMessages(exceptions[1]))
+
+        sut.close()
+    }
+
+    @Test
+    fun `addExceptionStep is a no-op when exception steps are disabled`() {
+        val http = mockHttp()
+        val url = http.url("/")
+
+        val sut =
+            getSut(
+                url.toString(),
+                preloadFeatureFlags = false,
+                reloadFeatureFlags = false,
+                exceptionStepsEnabled = false,
+            )
+
+        sut.addExceptionStep("A")
+        sut.captureException(RuntimeException("boom"))
+
+        queueExecutor.shutdownAndAwaitTermination()
+
+        val request = http.takeRequest()
+        val content = request.body.unGzip()
+        val batch = serializer.deserialize<PostHogBatchEvent>(content.reader())
+
+        assertTrue(exceptionStepMessages(batch.batch.first()).isEmpty())
+
+        sut.close()
+    }
+
+    @Test
+    fun `addExceptionStep is a no-op when maxBytes is not positive`() {
+        val http = mockHttp()
+        val url = http.url("/")
+
+        val sut =
+            getSut(
+                url.toString(),
+                preloadFeatureFlags = false,
+                reloadFeatureFlags = false,
+                exceptionStepsMaxBytes = 0,
+            )
+
+        sut.addExceptionStep("A")
+        sut.captureException(RuntimeException("boom"))
+
+        queueExecutor.shutdownAndAwaitTermination()
+
+        val request = http.takeRequest()
+        val content = request.body.unGzip()
+        val batch = serializer.deserialize<PostHogBatchEvent>(content.reader())
+
+        assertTrue(exceptionStepMessages(batch.batch.first()).isEmpty())
+
+        sut.close()
+    }
+
+    @Test
+    fun `addExceptionStep clears the buffer on optOut and stops buffering while opted out`() {
+        val http = mockHttp()
+        val url = http.url("/")
+
+        val sut = getSut(url.toString(), preloadFeatureFlags = false, reloadFeatureFlags = false)
+
+        sut.addExceptionStep("before opt-out")
+        sut.optOut()
+        sut.addExceptionStep("while opted out")
+        sut.optIn()
+
+        sut.captureException(RuntimeException("boom"))
+
+        queueExecutor.shutdownAndAwaitTermination()
+
+        val request = http.takeRequest()
+        val content = request.body.unGzip()
+        val batch = serializer.deserialize<PostHogBatchEvent>(content.reader())
+
+        assertTrue(exceptionStepMessages(batch.batch.first()).isEmpty())
+
+        sut.close()
+    }
+
+    @Test
+    fun `exception steps attach to a generic capture of the exception event`() {
+        // Hybrid SDKs (RN/Flutter) forward steps via addExceptionStep and emit the
+        // exception through the generic capture() entry point rather than captureException.
+        val http = mockHttp()
+        val url = http.url("/")
+
+        val sut = getSut(url.toString(), preloadFeatureFlags = false, reloadFeatureFlags = false)
+
+        sut.addExceptionStep("A")
+        sut.addExceptionStep("B")
+
+        sut.capture("\$exception", properties = mapOf("\$exception_message" to "boom"))
+
+        queueExecutor.shutdownAndAwaitTermination()
+
+        val request = http.takeRequest()
+        val content = request.body.unGzip()
+        val batch = serializer.deserialize<PostHogBatchEvent>(content.reader())
+
+        val theEvent = batch.batch.first()
+        assertEquals("\$exception", theEvent.event)
+        assertEquals(listOf("A", "B"), exceptionStepMessages(theEvent))
 
         sut.close()
     }

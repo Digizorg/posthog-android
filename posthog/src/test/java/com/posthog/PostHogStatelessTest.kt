@@ -1,7 +1,7 @@
 package com.posthog
 
+import com.posthog.internal.PostHogFeatureFlagCalledCache
 import com.posthog.internal.PostHogFeatureFlagsInterface
-import com.posthog.internal.PostHogLogger
 import com.posthog.internal.PostHogMemoryPreferences
 import com.posthog.internal.PostHogPreferences
 import com.posthog.internal.PostHogPreferences.Companion.GROUPS
@@ -43,7 +43,7 @@ internal class PostHogStatelessTest {
     ) : PostHogStateless(queueExecutor, featureFlagsExecutor) {
         fun isEnabledPublic(): Boolean = isEnabled()
 
-        fun setMockQueue(queue: PostHogQueueInterface) {
+        fun setMockQueue(queue: PostHogQueueInterface<PostHogEvent>) {
             this.queue = queue
         }
 
@@ -55,13 +55,19 @@ internal class PostHogStatelessTest {
             return mergeGroups(givenGroups)
         }
 
+        fun featureFlagsCalledCacheSize(): Int {
+            val field = PostHogStateless::class.java.getDeclaredField("featureFlagsCalled")
+            field.isAccessible = true
+            return (field.get(this) as? PostHogFeatureFlagCalledCache)?.size() ?: 0
+        }
+
         fun getPreferencesPublic(): PostHogPreferences {
             return getPreferences()
         }
     }
 
     // Mock classes for testing
-    private class MockQueue : PostHogQueueInterface {
+    private class MockQueue : PostHogQueueInterface<PostHogEvent> {
         val events = mutableListOf<PostHogEvent>()
         var isStarted = false
         var isStopped = false
@@ -237,10 +243,22 @@ internal class PostHogStatelessTest {
     }
 
     @Test
+    fun `setup no-ops for empty trimmed api key after logger initialization`() {
+        sut = createStatelessInstance()
+        val mockLogger = TestLogger()
+        config = PostHogConfig(" \n\t ", "https://api.posthog.com").apply { logger = mockLogger }
+
+        sut.setup(config)
+
+        assertFalse(sut.isEnabledPublic())
+        assertTrue(mockLogger.messages.any { it.contains("PostHog SDK is disabled because the API key is required") })
+    }
+
+    @Test
     fun `setup logs warning when called multiple times`() {
         sut = createStatelessInstance()
         config = createConfig()
-        val mockLogger = MockLogger()
+        val mockLogger = TestLogger()
         config.logger = mockLogger
 
         sut.setup(config)
@@ -255,7 +273,7 @@ internal class PostHogStatelessTest {
         val sut2 = createStatelessInstance()
         val config1 = createConfig()
         val config2 = createConfig()
-        val mockLogger = MockLogger()
+        val mockLogger = TestLogger()
         config2.logger = mockLogger
 
         sut1.setup(config1)
@@ -283,7 +301,7 @@ internal class PostHogStatelessTest {
     fun `close handles errors gracefully`() {
         sut = createStatelessInstance()
         config = createConfig()
-        val mockLogger = MockLogger()
+        val mockLogger = TestLogger()
         config.logger = mockLogger
 
         sut.close() // Close without setup
@@ -882,7 +900,7 @@ internal class PostHogStatelessTest {
     @Test
     fun `beforeSend error handling does not crash`() {
         val mockQueue = MockQueue()
-        val mockLogger = MockLogger()
+        val mockLogger = TestLogger()
         sut = createStatelessInstance()
         config =
             createConfig().apply {
@@ -1006,6 +1024,39 @@ internal class PostHogStatelessTest {
         assertEquals("variant_a", mockQueue.events[0].properties!!["${'$'}feature_flag_response"])
         assertEquals("user456", mockQueue.events[1].distinctId)
         assertEquals("variant_a", mockQueue.events[1].properties!!["${'$'}feature_flag_response"])
+    }
+
+    @Test
+    fun `close resets feature flag called cache before setup again`() {
+        val firstQueue = MockQueue()
+        val secondQueue = MockQueue()
+        val mockFeatureFlags = MockFeatureFlags()
+        mockFeatureFlags.setFlag("test_flag", "variant_a")
+
+        sut = createStatelessInstance()
+        config = createConfig(sendFeatureFlagEvent = true)
+
+        sut.setup(config)
+        sut.setMockQueue(firstQueue)
+        sut.setMockFeatureFlags(mockFeatureFlags)
+
+        sut.getFeatureFlagStateless("user123", "test_flag")
+        sut.getFeatureFlagStateless("user123", "test_flag")
+        assertEquals(1, firstQueue.events.size)
+        assertEquals(1, sut.featureFlagsCalledCacheSize())
+
+        sut.close()
+        assertEquals(0, sut.featureFlagsCalledCacheSize())
+
+        sut.setup(config)
+        sut.setMockQueue(secondQueue)
+        sut.setMockFeatureFlags(mockFeatureFlags)
+
+        sut.getFeatureFlagStateless("user123", "test_flag")
+
+        assertEquals(1, secondQueue.events.size)
+        assertEquals("user123", secondQueue.events[0].distinctId)
+        assertEquals("variant_a", secondQueue.events[0].properties!!["${'$'}feature_flag_response"])
     }
 
     @Test
@@ -1385,16 +1436,6 @@ internal class PostHogStatelessTest {
     }
 
     // Helper classes
-    private class MockLogger : PostHogLogger {
-        val messages = mutableListOf<String>()
-
-        override fun log(message: String) {
-            messages.add(message)
-        }
-
-        override fun isEnabled(): Boolean = true
-    }
-
     private class MockPostHogStateless : PostHogStatelessInterface {
         var setupCalled = false
         var closeCalled = false

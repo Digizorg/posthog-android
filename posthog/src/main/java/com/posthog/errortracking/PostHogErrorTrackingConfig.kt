@@ -2,6 +2,9 @@ package com.posthog.errortracking
 
 import com.posthog.PostHog
 
+/**
+ * Configuration for PostHog error tracking.
+ */
 public class PostHogErrorTrackingConfig
     @JvmOverloads
     public constructor(
@@ -27,4 +30,11 @@ public class PostHogErrorTrackingConfig
          * If this list of package names is empty, all frames will be considered inApp
          */
         public val inAppIncludes: MutableList<String> = mutableListOf(),
+        /**
+         * Configuration for exception steps (breadcrumb-style context records attached to
+         * every captured `$exception` event as `$exception_steps`).
+         *
+         * Record steps with [PostHog.addExceptionStep].
+         */
+        public val exceptionSteps: PostHogExceptionStepsConfig = PostHogExceptionStepsConfig(),
     )

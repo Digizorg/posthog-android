@@ -10,6 +10,7 @@ import com.posthog.android.internal.PostHogAndroidNetworkStatus
 import com.posthog.android.internal.PostHogAppInstallIntegration
 import com.posthog.android.internal.PostHogLifecycleObserverIntegration
 import com.posthog.android.internal.PostHogSharedPreferences
+import com.posthog.internal.PostHogLogger
 import org.junit.Rule
 import org.junit.rules.TemporaryFolder
 import org.junit.runner.RunWith
@@ -37,6 +38,20 @@ internal class PostHogAndroidTest {
     @AfterTest
     fun `set down`() {
         tmpDir.root.deleteRecursively()
+    }
+
+    @Test
+    fun `setup configures Android then core disables SDK for empty trimmed api key`() {
+        val config = PostHogAndroidConfig(" \n\t ")
+        val logger = TestLogger()
+        config.logger = logger
+
+        mockContextAppStart(context, tmpDir)
+
+        PostHogAndroid.setup(context, config)
+
+        assertTrue(PostHog.isOptOut())
+        assertTrue(logger.messages.any { it.contains("PostHog SDK is disabled because the API key is required") })
     }
 
     @Test
@@ -114,6 +129,41 @@ internal class PostHogAndroidTest {
         PostHogAndroid.setup(context, config)
 
         assertEquals(BuildConfig.VERSION_NAME, config.sdkVersion)
+    }
+
+    @Test
+    fun `overwrites sdkName and sdkVersion when not a wrapper SDK`() {
+        val config =
+            PostHogAndroidConfig(API_KEY).apply {
+                sdkName = "posthog"
+                sdkVersion = "0.0.0"
+            }
+
+        mockContextAppStart(context, tmpDir)
+
+        PostHogAndroid.setup(context, config)
+
+        assertEquals("posthog-android", config.sdkName)
+        assertEquals(BuildConfig.VERSION_NAME, config.sdkVersion)
+    }
+
+    @Test
+    fun `keeps wrapper SDK sdkName and sdkVersion`() {
+        for (sdkName in listOf("posthog-flutter", "posthog-react-native", "posthog-kmp")) {
+            PostHog.close()
+            val config =
+                PostHogAndroidConfig(API_KEY).apply {
+                    this.sdkName = sdkName
+                    sdkVersion = "1.2.3"
+                }
+
+            mockContextAppStart(context, tmpDir)
+
+            PostHogAndroid.setup(context, config)
+
+            assertEquals(sdkName, config.sdkName)
+            assertEquals("1.2.3", config.sdkVersion)
+        }
     }
 
     @Test
@@ -216,5 +266,15 @@ internal class PostHogAndroidTest {
         assertTrue(config.logger is PostHogAndroidLogger)
 
         postHog.close()
+    }
+
+    private class TestLogger : PostHogLogger {
+        val messages = mutableListOf<String>()
+
+        override fun log(message: String) {
+            messages.add(message)
+        }
+
+        override fun isEnabled(): Boolean = true
     }
 }

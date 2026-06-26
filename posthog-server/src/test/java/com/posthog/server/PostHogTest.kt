@@ -17,6 +17,7 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
+@Suppress("DEPRECATION")
 internal class PostHogTest {
     private fun createMockStateless(): PostHog {
         return spy(PostHog())
@@ -450,6 +451,17 @@ internal class PostHogTest {
 
         postHog.close()
         mockServer.shutdown()
+    }
+
+    @Test
+    fun `empty api key disables SDK`() {
+        val postHog = PostHog()
+
+        postHog.setup(PostHogConfig.builder(" \n\t ").build())
+
+        assertTrue(postHog.isOptOut())
+
+        postHog.close()
     }
 
     @Test
