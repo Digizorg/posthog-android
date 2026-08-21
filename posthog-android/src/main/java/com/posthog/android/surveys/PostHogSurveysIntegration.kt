@@ -89,6 +89,7 @@ public class PostHogSurveysIntegration(
 
     public override fun install(postHog: PostHogInterface) {
         this.postHog = postHog
+        restoreEventActivatedSurveys()
 
         // Start the survey integration lifecycle
         synchronized(lifecycleLock) {
@@ -335,13 +336,6 @@ public class PostHogSurveysIntegration(
 
                 // Send survey shown event
                 sendSurveyShownEvent(originalSurvey, resolvedLanguage)
-
-                // Clear up event-activated surveys if this survey has events
-                if (hasEvents(originalSurvey)) {
-                    synchronized(eventActivationLock) {
-                        eventActivatedSurveys.remove(originalSurvey.id)
-                    }
-                }
             } else {
                 config.logger.log("Received a show event for a non-matching survey: ${shownSurvey.id} vs ${originalSurvey.id}")
             }
@@ -375,7 +369,10 @@ public class PostHogSurveysIntegration(
                 }
             }
 
-            responsesToSend?.let { sendSurveySentEvent(originalSurvey, it, resolvedLanguage, resolvedQuestionTranslations) }
+            responsesToSend?.let {
+                sendSurveySentEvent(originalSurvey, it, resolvedLanguage, resolvedQuestionTranslations)
+                setSurveySeen(originalSurvey)
+            }
 
             nextQuestion
         }
@@ -924,8 +921,9 @@ public class PostHogSurveysIntegration(
         }
 
         val key = getSurveySeenKey(survey)
+        val genericKey = "${surveySeenKeyPrefix}${survey.id}"
         val seenKeys = synchronized(seenSurveysLock) { getSeenSurveyKeys() }
-        return seenKeys[key] ?: false
+        return seenKeys[key] ?: seenKeys[genericKey] ?: false
     }
 
     /**
@@ -944,7 +942,23 @@ public class PostHogSurveysIntegration(
             config.cachePreferences?.setValue(PostHogPreferences.SURVEY_SEEN, currentKeys)
         }
 
+        clearEventActivation(survey.id)
+
         // Update last seen survey date
+        setLastSeenSurveyDate(config.dateProvider.currentDate())
+    }
+
+    private fun setSurveySeen(surveyId: String) {
+        val key = "${surveySeenKeyPrefix}$surveyId"
+
+        synchronized(seenSurveysLock) {
+            val currentKeys = getSeenSurveyKeys().toMutableMap()
+            currentKeys[key] = true
+            seenSurveyKeys = currentKeys
+            config.cachePreferences?.setValue(PostHogPreferences.SURVEY_SEEN, currentKeys)
+        }
+
+        clearEventActivation(surveyId)
         setLastSeenSurveyDate(config.dateProvider.currentDate())
     }
 
@@ -1015,6 +1029,7 @@ public class PostHogSurveysIntegration(
             for (surveyId in matchingSurveyIds) {
                 eventActivatedSurveys.add(surveyId)
             }
+            persistEventActivatedSurveysLocked()
         }
 
         // Trigger survey display
@@ -1022,6 +1037,53 @@ public class PostHogSurveysIntegration(
         if (shouldShowSurvey) {
             showNextSurvey()
         }
+    }
+
+    private fun restoreEventActivatedSurveys() {
+        @Suppress("UNCHECKED_CAST")
+        val stored =
+            config.cachePreferences?.getValue(PostHogPreferences.SURVEY_EVENT_ACTIVATED) as? Map<String, Boolean>
+                ?: emptyMap()
+        synchronized(eventActivationLock) {
+            eventActivatedSurveys.clear()
+            eventActivatedSurveys.addAll(stored.filterValues { it }.keys)
+        }
+    }
+
+    private fun persistEventActivatedSurveysLocked() {
+        val activated = eventActivatedSurveys.associateWith { true }
+        config.cachePreferences?.setValue(PostHogPreferences.SURVEY_EVENT_ACTIVATED, activated)
+    }
+
+    private fun clearEventActivation(surveyId: String) {
+        synchronized(eventActivationLock) {
+            eventActivatedSurveys.remove(surveyId)
+            persistEventActivatedSurveysLocked()
+        }
+    }
+
+    public override fun markSurveySeen(
+        surveyId: String,
+        survey: Survey?,
+    ) {
+        if (survey != null) {
+            setSurveySeen(survey)
+        } else {
+            setSurveySeen(surveyId)
+        }
+    }
+
+    public override fun resetSurveyState() {
+        synchronized(seenSurveysLock) {
+            seenSurveyKeys = mutableMapOf()
+            config.cachePreferences?.setValue(PostHogPreferences.SURVEY_SEEN, emptyMap<String, Boolean>())
+        }
+        synchronized(eventActivationLock) {
+            eventActivatedSurveys.clear()
+            persistEventActivatedSurveysLocked()
+        }
+        clearActiveSurvey()
+        cleanupSurveys()
     }
 
     private fun matchPropertyFilters(

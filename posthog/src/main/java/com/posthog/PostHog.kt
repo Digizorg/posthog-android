@@ -1088,6 +1088,7 @@ public class PostHog private constructor(
     ) {
         if (!isEnabled() || isOptOut()) return
         val survey = findCachedSurvey(surveyId)
+        surveysHandler?.markSurveySeen(surveyId, survey)
         val props = baseSurveyProperties(surveyId, survey).toMutableMap()
         props.putAll(surveyResponses)
         val interactionKey =
@@ -1103,6 +1104,7 @@ public class PostHog private constructor(
     public override fun captureSurveyDismissed(surveyId: String) {
         if (!isEnabled() || isOptOut()) return
         val survey = findCachedSurvey(surveyId)
+        surveysHandler?.markSurveySeen(surveyId, survey)
         val props = baseSurveyProperties(surveyId, survey).toMutableMap()
         val interactionKey =
             if (survey != null) {
@@ -1712,6 +1714,7 @@ public class PostHog private constructor(
             except.add(ANONYMOUS_ID)
         }
         getPreferences().clear(except = except.toList())
+        surveysHandler?.resetSurveyState()
         remoteConfig?.clear()
         featureFlagsCalled.clear()
         lastScreenName = null

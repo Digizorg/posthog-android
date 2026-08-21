@@ -4,6 +4,8 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.posthog.PostHogConfig
 import com.posthog.PostHogInterface
+import com.posthog.internal.PostHogMemoryPreferences
+import com.posthog.internal.PostHogPreferences
 import com.posthog.surveys.Survey
 import com.posthog.surveys.SurveyConditions
 import com.posthog.surveys.SurveyEventCondition
@@ -22,10 +24,11 @@ import kotlin.test.assertTrue
 internal class PostHogSurveysEventPropertyFilterTest {
     private val context = ApplicationProvider.getApplicationContext<android.content.Context>()
 
-    private fun createIntegration(): PostHogSurveysIntegration {
+    private fun createIntegration(preferences: PostHogPreferences = PostHogMemoryPreferences()): PostHogSurveysIntegration {
         val config =
             PostHogConfig("test-api-key").apply {
                 surveys = true
+                cachePreferences = preferences
             }
         val integration = PostHogSurveysIntegration(context, config)
         val fake = mock<PostHogInterface>()
@@ -37,6 +40,7 @@ internal class PostHogSurveysEventPropertyFilterTest {
     private fun createSurvey(
         id: String,
         eventConditions: List<SurveyEventCondition>,
+        repeatedActivation: Boolean = true,
     ): Survey {
         return Survey(
             id = id,
@@ -58,7 +62,7 @@ internal class PostHogSurveysEventPropertyFilterTest {
                     seenSurveyWaitPeriodInDays = null,
                     events =
                         SurveyEventConditions(
-                            repeatedActivation = true,
+                            repeatedActivation = repeatedActivation,
                             values = eventConditions,
                         ),
                 ),
@@ -74,12 +78,32 @@ internal class PostHogSurveysEventPropertyFilterTest {
     @Test
     fun `event without property filters activates survey on matching event name`() {
         val integration = createIntegration()
-        val survey = createSurvey("s1", listOf(SurveyEventCondition(name = "purchase")))
+        val survey = createSurvey("s1", listOf(SurveyEventCondition(name = "purchase")), repeatedActivation = false)
         integration.onSurveysLoaded(listOf(survey))
 
         integration.onEvent("purchase", mapOf("amount" to 100))
 
         assertTrue(integration.getActiveMatchingSurveys().any { it.id == "s1" })
+    }
+
+    @Test
+    fun `event activation survives integration restart until survey is seen`() {
+        val preferences = PostHogMemoryPreferences()
+        val survey = createSurvey("s1", listOf(SurveyEventCondition(name = "purchase")))
+        val firstIntegration = createIntegration(preferences)
+        firstIntegration.onSurveysLoaded(listOf(survey))
+        firstIntegration.onEvent("purchase")
+
+        val restoredIntegration = createIntegration(preferences)
+        restoredIntegration.onSurveysLoaded(listOf(survey))
+        assertTrue(restoredIntegration.getActiveMatchingSurveys().any { it.id == "s1" })
+
+        restoredIntegration.markSurveySeen(survey.id, survey)
+        assertTrue(restoredIntegration.getActiveMatchingSurveys().isEmpty())
+
+        val completedIntegration = createIntegration(preferences)
+        completedIntegration.onSurveysLoaded(listOf(survey))
+        assertTrue(completedIntegration.getActiveMatchingSurveys().isEmpty())
     }
 
     @Test

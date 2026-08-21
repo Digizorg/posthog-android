@@ -29,4 +29,13 @@ public interface PostHogSurveysHandler {
      * (and as the iOS/JS SDKs).
      */
     public fun getActiveMatchingSurveys(): List<Survey>
+
+    /** Marks a survey as locally completed so it is excluded immediately. */
+    public fun markSurveySeen(
+        surveyId: String,
+        survey: Survey?,
+    )
+
+    /** Clears user-specific in-memory survey state after an identity reset. */
+    public fun resetSurveyState()
 }
